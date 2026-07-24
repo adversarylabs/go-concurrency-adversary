@@ -1,0 +1,56 @@
+{
+  "assessment": {
+    "risk": "high",
+    "summary": "The concurrency lifecycle is not safe to approve: a locally owned unbuffered channel blocks before any peer can run."
+  },
+  "findings": [
+    {
+      "ruleId": "go-concurrency.channel.self-deadlock",
+      "title": "A local unbuffered channel blocks before a peer can run",
+      "severity": "high",
+      "confidence": "high",
+      "evidence": [
+        {
+          "file": "main.go",
+          "line": 20,
+          "message": "The locally owned unbuffered channel results is used synchronously before any peer can run."
+        }
+      ],
+      "recommendation": "Start the peer before the blocking operation, use direct value flow when concurrency is unnecessary, or introduce buffering only when its ownership and capacity are intentional."
+    },
+    {
+      "ruleId": "go-concurrency.waitgroup.lifecycle",
+      "title": "WaitGroup registration races with the wait lifecycle",
+      "severity": "high",
+      "confidence": "high",
+      "evidence": [
+        {
+          "file": "main.go",
+          "line": 14,
+          "message": "workers.Add runs inside the goroutine it is intended to register."
+        }
+      ],
+      "recommendation": "Call Add in the launching goroutine before each go statement, then defer Done as the first operation inside the worker."
+    },
+    {
+      "ruleId": "go-concurrency.context.cancellation",
+      "title": "Cancellation ownership is discarded",
+      "severity": "medium",
+      "confidence": "high",
+      "evidence": [
+        {
+          "file": "main.go",
+          "line": 9,
+          "message": "context.WithCancel discards its cancellation function."
+        }
+      ],
+      "recommendation": "Retain the cancellation function and invoke it on every exit path, and pass the errgroup-derived context to work launched by that group."
+    }
+  ],
+  "positives": [],
+  "opinion": {
+    "ship": false,
+    "summary": "I would fix the deterministic channel deadlock before merging."
+  }
+}
+

@@ -1,0 +1,28 @@
+{
+  "assessment": {
+    "risk": "medium",
+    "summary": "The control flow is understandable, but cancellation ownership is incomplete and can let work or context resources outlive their intended scope."
+  },
+  "findings": [
+    {
+      "ruleId": "go-concurrency.context.cancellation",
+      "title": "Cancellation ownership is discarded",
+      "severity": "medium",
+      "confidence": "high",
+      "evidence": [
+        {
+          "file": "main.go",
+          "line": 9,
+          "message": "context.WithTimeout discards its cancellation function."
+        }
+      ],
+      "recommendation": "Retain the cancellation function and invoke it on every exit path, and pass the errgroup-derived context to work launched by that group."
+    }
+  ],
+  "positives": [],
+  "opinion": {
+    "ship": false,
+    "summary": "I would make cancellation ownership explicit before merging."
+  }
+}
+

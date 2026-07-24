@@ -1,0 +1,28 @@
+{
+  "assessment": {
+    "risk": "high",
+    "summary": "Worker completion is not reliable because WaitGroup registration occurs after goroutine launch and can race with Wait."
+  },
+  "findings": [
+    {
+      "ruleId": "go-concurrency.waitgroup.lifecycle",
+      "title": "WaitGroup registration races with the wait lifecycle",
+      "severity": "high",
+      "confidence": "high",
+      "evidence": [
+        {
+          "file": "main.go",
+          "line": 8,
+          "message": "workers.Add runs inside the goroutine it is intended to register."
+        }
+      ],
+      "recommendation": "Call Add in the launching goroutine before each go statement, then defer Done as the first operation inside the worker."
+    }
+  ],
+  "positives": [],
+  "opinion": {
+    "ship": false,
+    "summary": "I would move worker registration into the launching goroutine before merging."
+  }
+}
+
