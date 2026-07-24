@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,8 +38,9 @@ function snapshot(output: ReviewResult) {
 
 for (const grade of ["excellent", "good", "average", "poor", "terrible"]) {
   test(`${grade} fixture matches its expected review snapshot`, async () => {
-    const root = join(projectRoot, "fixtures", grade);
-    const expected = JSON.parse(await readFile(join(root, "expected.review.json"), "utf8"));
+    const fixture = join(projectRoot, "fixtures", grade);
+    const root = await isolatedFixture(fixture);
+    const expected = JSON.parse(await readFile(join(fixture, "expected.review.json"), "utf8"));
     assert.deepEqual(snapshot(await review(root)), expected);
   });
 }
@@ -124,7 +125,7 @@ func old(parent context.Context) context.Context {
 });
 
 test("review output is deterministic", async () => {
-  const root = join(projectRoot, "fixtures", "terrible");
+  const root = await isolatedFixture(join(projectRoot, "fixtures", "terrible"));
   assert.deepEqual(await review(root), await review(root));
 });
 
@@ -132,5 +133,11 @@ async function repository(source: string): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "go-concurrency-"));
   await mkdir(root, { recursive: true });
   await writeFile(join(root, "main.go"), source);
+  return root;
+}
+
+async function isolatedFixture(fixture: string): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "go-concurrency-fixture-"));
+  await cp(fixture, root, { recursive: true });
   return root;
 }
