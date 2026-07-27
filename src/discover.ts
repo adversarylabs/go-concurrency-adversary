@@ -41,7 +41,7 @@ async function trackedRepository(repoPath: string): Promise<Discovery> {
 
 async function diffDiscovery(repoPath: string, base: string, names: string): Promise<Discovery> {
   const records = parseNameStatus(names)
-    .filter((record) => record.status !== "D" && domain.includePath(record.path))
+    .filter((record) => record.status !== "D" && isGoSource(record.path))
     .slice(0, MAX_FILES);
   const files: SourceRevision[] = [];
   for (const record of records) {
