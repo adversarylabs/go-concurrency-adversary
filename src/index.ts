@@ -10,12 +10,12 @@ import { reviewConcurrency } from "./review.js";
 export function createApp(): Adversary {
   const app = new Adversary({
     name: "go-concurrency",
-    version: "0.0.3",
+    version: "0.0.4",
     review: { maximumFindings: 5, minimumConfidence: "medium" },
   });
 
   app.rule("go-concurrency.review", async (ctx) => {
-    const discovery = await discoverGoSources(ctx.repoPath);
+    const discovery = await discoverGoSources(ctx.repoPath, ctx.change);
     const analysis = await analyzeDiscovery(discovery);
     ctx.summary.files_scanned = analysis.filesScanned;
     ctx.review.observe({
