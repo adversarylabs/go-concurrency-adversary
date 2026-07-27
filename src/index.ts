@@ -10,7 +10,7 @@ import { reviewConcurrency } from "./review.js";
 export function createApp(): Adversary {
   const app = new Adversary({
     name: "go-concurrency",
-    version: "0.0.1",
+    version: "0.0.2",
     review: { maximumFindings: 5, minimumConfidence: "medium" },
   });
 
@@ -29,7 +29,15 @@ export function createApp(): Adversary {
         parseErrors: analysis.parseErrors,
       },
     });
-    reviewConcurrency(ctx, analysis);
+    await reviewConcurrency(
+      ctx,
+      analysis,
+      discovery.files.map((file) => ({
+        path: file.path,
+        current: file.current,
+        status: file.status,
+      })),
+    );
   });
 
   return app;

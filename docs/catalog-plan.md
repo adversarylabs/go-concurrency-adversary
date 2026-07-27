@@ -6,7 +6,8 @@ The catalog is organized around engineering expertise rather than package names.
 
 Every adversary will:
 
-- parse Go and the domain configuration it needs without executing the target;
+- consume immutable, provenance-carrying review context prepared by the runtime;
+- avoid repository walking, Git invocation, direct file reads, and bundled language parsers;
 - synthesize a few remediation-oriented findings instead of emitting linter output;
 - own `fixtures/excellent`, `good`, `average`, `poor`, and `terrible`;
 - snapshot the complete stable review contract for each fixture;
@@ -14,6 +15,8 @@ Every adversary will:
 - measure high-confidence false positives before expanding its rule set;
 - detect both repository relevance and change relevance, preferring precision;
 - explain whether an experienced Go engineer would approve the change and what to fix first.
+
+The runtime capability requirements discovered across the catalog are documented in [ReviewContext capability discovery](review-context-capabilities.md).
 
 The shared fixture scale is semantic:
 
@@ -315,4 +318,3 @@ Each adversary advances through the same gates:
 7. Publish only after CI, corpus checks, snapshots, manifest validation, and pack validation pass.
 
 Go Concurrency is the reference implementation for this process. Go Testing is next.
-

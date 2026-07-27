@@ -8,6 +8,8 @@ It is built around one review question:
 
 The adversary parses Go with the official Tree-sitter Go grammar. It does not execute the target repository and does not report findings from raw text matches.
 
+> Architecture note: the current parser and repository discovery are transitional. The target design makes the runtime responsible for context preparation and leaves this adversary responsible for expert concurrency judgment. See [ReviewContext capability discovery](docs/review-context-capabilities.md).
+
 ## Initial rules
 
 | Rule | Review question |
@@ -48,4 +50,3 @@ adversary pack --check .
 ```
 
 The release artifact bundles the SDK and parser runtime and ships the Tree-sitter runtime and Go grammar as two WASM assets. It does not require `node_modules` at execution time.
-

@@ -1,7 +1,12 @@
 import { type RuleContext } from "@adversarylabs/sdk";
+import { runModelConcurrencyReview, type DiscoveryFile } from "./model-review.js";
 import { type Analysis, type Signal } from "./types.js";
 
-export function reviewConcurrency(ctx: RuleContext, analysis: Analysis): void {
+export async function reviewConcurrency(
+  ctx: RuleContext,
+  analysis: Analysis,
+  discoveryFiles: DiscoveryFile[] = [],
+): Promise<void> {
   const deadlocks = matching(analysis, "go-concurrency.channel.self-deadlock");
   const waitGroups = matching(analysis, "go-concurrency.waitgroup.lifecycle");
   const cancellation = matching(analysis, "go-concurrency.context.cancellation");
@@ -35,6 +40,26 @@ export function reviewConcurrency(ctx: RuleContext, analysis: Analysis): void {
   });
 
   addPositives(ctx, analysis);
+
+  const staticSeverities: Array<"none" | "low" | "medium" | "high" | "critical"> = [];
+  if (deadlocks.length > 0) staticSeverities.push("high");
+  if (waitGroups.length > 0) staticSeverities.push("high");
+  if (cancellation.length > 0) staticSeverities.push("medium");
+  const staticPrimaryConcern =
+    deadlocks.length > 0 ? "local channel self-deadlocks" :
+    waitGroups.length > 0 ? "WaitGroup registration races" :
+    cancellation.length > 0 ? "discarded cancellation ownership" :
+    undefined;
+  const modelStatus = await runModelConcurrencyReview(
+    ctx,
+    analysis,
+    discoveryFiles,
+    staticSeverities,
+    staticPrimaryConcern,
+  );
+  if (modelStatus === "applied") {
+    return;
+  }
   addAssessment(ctx, { deadlocks, waitGroups, cancellation });
 }
 
