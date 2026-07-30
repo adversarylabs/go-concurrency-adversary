@@ -3,7 +3,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { join, sep } from "node:path";
 import { promisify } from "node:util";
 import { type ChangeContext } from "@adversarylabs/sdk";
-import { type Discovery, type SourceRevision } from "./types.js";
+import { type Discovery, type GoVersion, type SourceRevision } from "./types.js";
 
 const execute = promisify(execFile);
 const IGNORED_DIRECTORIES = new Set([
@@ -16,13 +16,17 @@ export async function discoverGoSources(
   repoPath: string,
   change: ChangeContext | null,
 ): Promise<Discovery> {
+  const goVersion = await readGoVersion(repoPath);
   if (!(await isGitRepository(repoPath)) || !(await revisionExists(repoPath, "HEAD"))) {
-    return { mode: "repository", files: await readSources(repoPath, await repositoryFiles(repoPath)) };
+    return withGoVersion(
+      { mode: "repository", files: await readSources(repoPath, await repositoryFiles(repoPath)) },
+      goVersion,
+    );
   }
 
   // Explicit whole-target reviews must not collapse to a tiny incidental diff.
   if (change !== null && change.scanMode === "all") {
-    return trackedRepository(repoPath);
+    return withGoVersion(await trackedRepository(repoPath), goVersion);
   }
 
   if (change !== null && change.scanMode === "changed" &&
@@ -32,20 +36,32 @@ export async function discoverGoSources(
       repoPath,
       ["diff", "--name-status", "--find-renames", change.baseRef, ...head, "--"],
     );
-    return diffDiscovery(repoPath, change.baseRef, names);
+    return withGoVersion(await diffDiscovery(repoPath, change.baseRef, names), goVersion);
   }
 
   // Auto: dirty worktree vs HEAD, then branch base vs HEAD, else whole repository.
   const worktree = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", "HEAD", "--"]);
-  if (worktree.trim() !== "") return diffDiscovery(repoPath, "HEAD", worktree);
+  if (worktree.trim() !== "") return withGoVersion(await diffDiscovery(repoPath, "HEAD", worktree), goVersion);
 
   const base = await chooseBase(repoPath);
   if (base !== undefined) {
     const names = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", base, "HEAD", "--"]);
-    if (names.trim() !== "") return diffDiscovery(repoPath, base, names);
+    if (names.trim() !== "") return withGoVersion(await diffDiscovery(repoPath, base, names), goVersion);
   }
 
-  return trackedRepository(repoPath);
+  return withGoVersion(await trackedRepository(repoPath), goVersion);
+}
+
+function withGoVersion(discovery: Discovery, goVersion: GoVersion | undefined): Discovery {
+  return goVersion === undefined ? discovery : { ...discovery, goVersion };
+}
+
+async function readGoVersion(repoPath: string): Promise<GoVersion | undefined> {
+  const content = await safeRead(join(repoPath, "go.mod"));
+  if (content === undefined) return undefined;
+  const match = /^go\s+(\d+)\.(\d+)\b/m.exec(content);
+  if (match === null) return undefined;
+  return { major: Number(match[1]), minor: Number(match[2]) };
 }
 
 async function trackedRepository(repoPath: string): Promise<Discovery> {

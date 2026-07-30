@@ -1,6 +1,6 @@
 import { type RuleContext } from "@adversarylabs/sdk";
 import { runModelConcurrencyReview, type DiscoveryFile } from "./model-review.js";
-import { type Analysis, type Signal } from "./types.js";
+import { type Analysis, type GoVersion, type Signal } from "./types.js";
 
 export async function reviewConcurrency(
   ctx: RuleContext,
@@ -9,7 +9,13 @@ export async function reviewConcurrency(
 ): Promise<void> {
   const deadlocks = matching(analysis, "go-concurrency.channel.self-deadlock");
   const waitGroups = matching(analysis, "go-concurrency.waitgroup.lifecycle");
+  const waitGroupCopied = matching(analysis, "go-concurrency.waitgroup.copied");
+  const mutexCopy = matching(analysis, "go-concurrency.mutex.copy");
+  const loopVars = matching(analysis, "go-concurrency.loopvar.capture");
   const cancellation = matching(analysis, "go-concurrency.context.cancellation");
+  const selectBusy = matching(analysis, "go-concurrency.select.default-busy");
+  const tickers = matching(analysis, "go-concurrency.ticker.not-stopped");
+  const timers = matching(analysis, "go-concurrency.timer.not-stopped");
 
   emitGroupedFinding(ctx, deadlocks, {
     title: "A local unbuffered channel blocks before a peer can run",
@@ -29,6 +35,33 @@ export async function reviewConcurrency(
     impact: "Shutdown and completion code can run while workers are still active, causing data races, resource teardown, or intermittent test failures.",
     recommendation: "Call Add in the launching goroutine before each go statement, then defer Done as the first operation inside the worker.",
   });
+  emitGroupedFinding(ctx, waitGroupCopied, {
+    title: "WaitGroup is copied by value",
+    category: "correctness",
+    severity: "high",
+    summary: (count) => `${count} WaitGroup value${count === 1 ? "" : "s"} are passed by value, so Add/Done/Wait no longer share one counter.`,
+    whyItMatters: "sync.WaitGroup must not be copied after first use; a by-value parameter is a fresh counter that cannot observe the caller's registrations.",
+    impact: "Wait can return while workers are still running, or Done can panic when the copied counter goes negative.",
+    recommendation: "Pass *sync.WaitGroup (or embed WaitGroup behind a pointer receiver) so all callers share the same counter.",
+  });
+  emitGroupedFinding(ctx, mutexCopy, {
+    title: "Mutex is copied by value",
+    category: "correctness",
+    severity: "critical",
+    summary: (count) => `${count} mutex value cop${count === 1 ? "y" : "ies"} can unlock a different lock instance than the one that was acquired.`,
+    whyItMatters: "sync.Mutex and sync.RWMutex are not safe to copy; copies have independent state and break mutual exclusion.",
+    impact: "Concurrent critical sections can run without synchronization, causing data races and corrupted shared state.",
+    recommendation: "Pass or store *sync.Mutex/*sync.RWMutex (or embed the mutex in a struct used only via pointer) and never assign mutex values.",
+  });
+  emitGroupedFinding(ctx, loopVars, {
+    title: "Goroutine captures a loop variable without binding",
+    category: "correctness",
+    severity: "high",
+    summary: (count) => `${count} goroutine${count === 1 ? "" : "s"} close over a loop variable without shadowing or parameter binding.`,
+    whyItMatters: "Before Go 1.22 loop variables were shared across iterations; the classic unshadowed capture is still a portability hazard and often a real bug on older toolchains.",
+    impact: "Workers may all observe the last iteration value, producing wrong results or races that only appear under load.",
+    recommendation: "Shadow with `x := x` before the go statement, or pass the value as a goroutine parameter: `go func(x T) { ... }(x)`.",
+  });
   emitGroupedFinding(ctx, cancellation, {
     title: "Cancellation ownership is discarded",
     category: "reliability",
@@ -38,17 +71,58 @@ export async function reviewConcurrency(
     impact: "Work can outlive its owner, timers and context relationships remain live longer than necessary, and peer failures may not stop dependent operations.",
     recommendation: "Retain the cancellation function and invoke it on every exit path, and pass the errgroup-derived context to work launched by that group.",
   });
+  emitGroupedFinding(ctx, selectBusy, {
+    title: "Select default inside a loop busy-spins",
+    category: "performance",
+    severity: "medium",
+    summary: (count) => `${count} loop${count === 1 ? "" : "s"} use select with only a default case, spinning the CPU when no case is ready.`,
+    whyItMatters: "A select with only default never blocks; nested in a for loop it becomes a tight spin.",
+    impact: "A single goroutine can consume a full CPU core and starve other work until the process is stopped.",
+    recommendation: "Block on a real case (channel, timer, or ctx.Done), or use a ticker/backoff instead of an empty default.",
+  });
+  emitGroupedFinding(ctx, tickers, {
+    title: "Ticker is never stopped",
+    category: "reliability",
+    severity: "medium",
+    summary: (count) => `${count} ticker${count === 1 ? "" : "s"} are started without Stop (or via time.Tick, which cannot be stopped).`,
+    whyItMatters: "Tickers hold runtime resources until Stop; time.Tick never exposes Stop and runs for process lifetime.",
+    impact: "Long-lived services accumulate timers and goroutine wakeups, increasing CPU and memory use over time.",
+    recommendation: "Prefer time.NewTicker and defer ticker.Stop() when the ticker's owner exits; avoid time.Tick outside of infinite process-lifetime loops in main.",
+  });
+  emitGroupedFinding(ctx, timers, {
+    title: "time.After is used inside a loop",
+    category: "reliability",
+    severity: timerSeverity(analysis.goVersion),
+    summary: (count) => `${count} loop${count === 1 ? "" : "s"} call time.After each iteration, creating short-lived timers that are not explicitly stopped.`,
+    whyItMatters: "Before Go 1.23, unstopped After timers could leak until they fired; on newer Go they are GC-eligible but still allocate every iteration.",
+    impact: goVersionAtLeast(analysis.goVersion, 1, 23)
+      ? "Each iteration allocates a timer, adding allocation and scheduling churn under tight loops."
+      : "Timers can accumulate until their duration elapses, increasing memory use and timer-queue pressure.",
+    recommendation: "Use time.NewTimer with Reset/Stop in the loop, or restructure to a single timer outside the loop.",
+  });
 
   addPositives(ctx, analysis);
 
   const staticSeverities: Array<"none" | "low" | "medium" | "high" | "critical"> = [];
   if (deadlocks.length > 0) staticSeverities.push("high");
   if (waitGroups.length > 0) staticSeverities.push("high");
+  if (waitGroupCopied.length > 0) staticSeverities.push("high");
+  if (mutexCopy.length > 0) staticSeverities.push("critical");
+  if (loopVars.length > 0) staticSeverities.push("high");
   if (cancellation.length > 0) staticSeverities.push("medium");
+  if (selectBusy.length > 0) staticSeverities.push("medium");
+  if (tickers.length > 0) staticSeverities.push("medium");
+  if (timers.length > 0) staticSeverities.push(timerSeverity(analysis.goVersion));
   const staticPrimaryConcern =
     deadlocks.length > 0 ? "local channel self-deadlocks" :
+    mutexCopy.length > 0 ? "copied mutex values" :
     waitGroups.length > 0 ? "WaitGroup registration races" :
+    waitGroupCopied.length > 0 ? "WaitGroup value copies" :
+    loopVars.length > 0 ? "loop variable captures in goroutines" :
     cancellation.length > 0 ? "discarded cancellation ownership" :
+    selectBusy.length > 0 ? "busy-spinning select defaults" :
+    tickers.length > 0 ? "tickers without Stop" :
+    timers.length > 0 ? "time.After inside loops" :
     undefined;
   const modelStatus = await runModelConcurrencyReview(
     ctx,
@@ -60,11 +134,31 @@ export async function reviewConcurrency(
   if (modelStatus === "applied") {
     return;
   }
-  addAssessment(ctx, { deadlocks, waitGroups, cancellation });
+  addAssessment(ctx, {
+    deadlocks,
+    waitGroups,
+    waitGroupCopied,
+    mutexCopy,
+    loopVars,
+    cancellation,
+    selectBusy,
+    tickers,
+    timers,
+    ...(analysis.goVersion === undefined ? {} : { goVersion: analysis.goVersion }),
+  });
 }
 
 function matching(analysis: Analysis, ruleId: Signal["ruleId"]): Signal[] {
   return analysis.signals.filter((signal) => signal.ruleId === ruleId);
+}
+
+function timerSeverity(goVersion: GoVersion | undefined): "low" | "medium" {
+  return goVersionAtLeast(goVersion, 1, 23) ? "low" : "medium";
+}
+
+function goVersionAtLeast(goVersion: GoVersion | undefined, major: number, minor: number): boolean {
+  if (goVersion === undefined) return false;
+  return goVersion.major > major || (goVersion.major === major && goVersion.minor >= minor);
 }
 
 function emitGroupedFinding(
@@ -73,7 +167,7 @@ function emitGroupedFinding(
   input: {
     title: string;
     category: string;
-    severity: "medium" | "high";
+    severity: "low" | "medium" | "high" | "critical";
     summary: (count: number) => string;
     whyItMatters: string;
     impact: string;
@@ -133,7 +227,18 @@ function addPositives(ctx: RuleContext, analysis: Analysis): void {
 
 function addAssessment(
   ctx: RuleContext,
-  groups: { deadlocks: Signal[]; waitGroups: Signal[]; cancellation: Signal[] },
+  groups: {
+    deadlocks: Signal[];
+    waitGroups: Signal[];
+    waitGroupCopied: Signal[];
+    mutexCopy: Signal[];
+    loopVars: Signal[];
+    cancellation: Signal[];
+    selectBusy: Signal[];
+    tickers: Signal[];
+    timers: Signal[];
+    goVersion?: GoVersion;
+  },
 ): void {
   if (groups.deadlocks.length > 0) {
     ctx.review.assessment({
@@ -143,6 +248,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would fix the deterministic channel deadlock before merging.",
+    });
+    return;
+  }
+  if (groups.mutexCopy.length > 0) {
+    ctx.review.assessment({
+      risk: "critical",
+      summary: "Mutual exclusion is not reliable because a mutex value is copied, so locks no longer protect a single shared instance.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would eliminate mutex value copies before merging.",
     });
     return;
   }
@@ -157,6 +273,28 @@ function addAssessment(
     });
     return;
   }
+  if (groups.waitGroupCopied.length > 0) {
+    ctx.review.assessment({
+      risk: "high",
+      summary: "WaitGroup coordination is broken because the counter is copied by value instead of shared through a pointer.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would pass WaitGroup by pointer before merging.",
+    });
+    return;
+  }
+  if (groups.loopVars.length > 0) {
+    ctx.review.assessment({
+      risk: "high",
+      summary: "Goroutines capture loop variables without per-iteration binding, which is incorrect on pre-1.22 toolchains and a portability hazard.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would bind loop variables before launching goroutines before merging.",
+    });
+    return;
+  }
   if (groups.cancellation.length > 0) {
     ctx.review.assessment({
       risk: "medium",
@@ -165,6 +303,44 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would make cancellation ownership explicit before merging.",
+    });
+    return;
+  }
+  if (groups.selectBusy.length > 0) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "A select with only default inside a loop busy-spins and will burn CPU under load.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would replace the busy-spin select with a blocking wait before merging.",
+    });
+    return;
+  }
+  if (groups.tickers.length > 0) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "Tickers are started without Stop (or via time.Tick), which leaks timer resources for the process lifetime of the owner.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would stop tickers on exit paths before merging.",
+    });
+    return;
+  }
+  if (groups.timers.length > 0) {
+    const severity = timerSeverity(groups.goVersion);
+    ctx.review.assessment({
+      risk: severity,
+      summary: severity === "low"
+        ? "time.After is used inside a loop; on Go 1.23+ this is mainly allocation churn rather than a hard leak."
+        : "time.After is used inside a loop, which can accumulate unstopped timers until each fires.",
+    });
+    ctx.review.opinion({
+      ship: severity === "low",
+      summary: severity === "low"
+        ? "I would prefer NewTimer/Reset, but this is not a merge blocker on Go 1.23+."
+        : "I would replace in-loop time.After with a reusable timer before merging.",
     });
     return;
   }

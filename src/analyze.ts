@@ -21,6 +21,7 @@ export async function analyzeDiscovery(discovery: Discovery): Promise<Analysis> 
     mode: discovery.mode,
     ...(discovery.base === undefined ? {} : { base: discovery.base }),
     filesScanned: discovery.files.length,
+    ...(discovery.goVersion === undefined ? {} : { goVersion: discovery.goVersion }),
     signals: stableSignals(signals),
     positives: stablePositives(positives),
     parseErrors,
@@ -65,11 +66,113 @@ function analyzeFunction(
   positives: PositiveSignal[],
 ): void {
   const body = fn.childForFieldName("body");
-  if (body === null) return;
   const syncAlias = aliases.get("sync");
+  analyzeCopyLocks(file, fn, syncAlias, signals);
+  if (body === null) return;
   if (syncAlias !== undefined) analyzeWaitGroups(file, body, syncAlias, signals, positives);
   analyzeCancellation(file, body, aliases, signals, positives);
   analyzeChannels(file, body, signals);
+  analyzeLoopVarCapture(file, body, signals);
+  analyzeSelectDefaultBusy(file, body, signals);
+  analyzeTickers(file, fn, body, aliases, signals);
+  analyzeTimers(file, body, aliases, signals);
+}
+
+function analyzeCopyLocks(
+  file: SourceRevision,
+  fn: Node,
+  syncAlias: string | undefined,
+  signals: Signal[],
+): void {
+  if (syncAlias === undefined) return;
+  const waitGroupType = `${syncAlias}.WaitGroup`;
+  const mutexTypes = new Set([`${syncAlias}.Mutex`, `${syncAlias}.RWMutex`]);
+
+  for (const parameter of parameterDeclarations(fn)) {
+    const typeNode = parameter.childForFieldName("type");
+    if (typeNode === null) continue;
+    const typeText = sourceText(typeNode, file.current);
+    if (typeText === waitGroupType) {
+      const name = parameter.childForFieldName("name");
+      signals.push(signal(file, parameter, "go-concurrency.waitgroup.copied",
+        `WaitGroup is passed by value${name === null ? "" : ` as parameter ${sourceText(name, file.current)}`}; copies break Add/Done/Wait counter sharing.`,
+        { type: waitGroupType, form: "parameter" }));
+    } else if (mutexTypes.has(typeText)) {
+      const name = parameter.childForFieldName("name");
+      signals.push(signal(file, parameter, "go-concurrency.mutex.copy",
+        `${typeText} is passed by value${name === null ? "" : ` as parameter ${sourceText(name, file.current)}`}; mutex copies unlock independently of the original.`,
+        { type: typeText, form: "parameter" }));
+    }
+  }
+
+  const body = fn.childForFieldName("body");
+  if (body === null) return;
+
+  const mutexNames = new Set<string>();
+  for (const parameter of parameterDeclarations(fn)) {
+    const typeNode = parameter.childForFieldName("type");
+    const nameNode = parameter.childForFieldName("name");
+    if (typeNode === null || nameNode === null) continue;
+    if (mutexTypes.has(sourceText(typeNode, file.current))) {
+      mutexNames.add(sourceText(nameNode, file.current));
+    }
+  }
+  for (const declaration of descendants(body, "var_spec")) {
+    const type = declaration.childForFieldName("type");
+    const name = declaration.childForFieldName("name");
+    if (type !== null && name !== null && mutexTypes.has(sourceText(type, file.current))) {
+      mutexNames.add(sourceText(name, file.current));
+    }
+  }
+  for (const declaration of descendants(body, "short_var_declaration")) {
+    const left = declaration.childForFieldName("left");
+    const right = declaration.childForFieldName("right");
+    const names = left?.namedChildren.map((node) => sourceText(node, file.current)) ?? [];
+    const values = right?.namedChildren ?? [];
+    if (names.length === 1 && values.length === 1) {
+      const valueText = sourceText(values[0]!, file.current);
+      if (mutexTypes.has(valueText) || [...mutexTypes].some((type) => valueText.startsWith(`${type}{`))) {
+        mutexNames.add(names[0]!);
+      }
+    }
+  }
+
+  for (const declaration of descendants(body, "short_var_declaration")) {
+    const left = declaration.childForFieldName("left");
+    const right = declaration.childForFieldName("right");
+    const names = left?.namedChildren.map((node) => sourceText(node, file.current)) ?? [];
+    const values = right?.namedChildren ?? [];
+    if (names.length !== 1 || values.length !== 1) continue;
+    const value = values[0]!;
+    if (value.type !== "identifier") continue;
+    const sourceName = sourceText(value, file.current);
+    if (!mutexNames.has(sourceName)) continue;
+    signals.push(signal(file, declaration, "go-concurrency.mutex.copy",
+      `Mutex value ${sourceName} is copied into ${names[0]!}; copies unlock independently of the original.`,
+      { form: "assignment", from: sourceName, to: names[0]! }));
+    mutexNames.add(names[0]!);
+  }
+
+  for (const assignment of descendants(body, "assignment_statement")) {
+    const left = assignment.childForFieldName("left");
+    const right = assignment.childForFieldName("right");
+    const names = left?.namedChildren.map((node) => sourceText(node, file.current)) ?? [];
+    const values = right?.namedChildren ?? [];
+    if (names.length !== 1 || values.length !== 1) continue;
+    const value = values[0]!;
+    if (value.type !== "identifier") continue;
+    const sourceName = sourceText(value, file.current);
+    if (!mutexNames.has(sourceName)) continue;
+    signals.push(signal(file, assignment, "go-concurrency.mutex.copy",
+      `Mutex value ${sourceName} is copied into ${names[0]!}; copies unlock independently of the original.`,
+      { form: "assignment", from: sourceName, to: names[0]! }));
+  }
+}
+
+function parameterDeclarations(fn: Node): Node[] {
+  const list = fn.childForFieldName("parameters");
+  if (list === null) return [];
+  return list.namedChildren.filter((node) => node.type === "parameter_declaration");
 }
 
 function analyzeWaitGroups(
@@ -177,8 +280,37 @@ function analyzeCancellation(
         line: assignment.startPosition.row + 1,
         summary: `${sourceText(functionNode, file.current)} retains and invokes ${lifecycleName}.`,
       });
+    } else if (helper.kind === "cancel" && !identifierUsedOutsideBinding(body, file.current, lifecycleName, left)) {
+      signals.push(signal(file, assignment, "go-concurrency.context.cancellation",
+        `${sourceText(functionNode, file.current)} retains ${lifecycleName} but never uses it; the cancel function is never invoked.`,
+        { helper: helper.helper, discarded: "cancel-function-unused" }));
     }
   }
+}
+
+function identifierUsedOutsideBinding(
+  body: Node,
+  source: string,
+  name: string,
+  bindingLeft: Node | null,
+): boolean {
+  let used = false;
+  walk(body, (candidate) => {
+    if (used || candidate.type !== "identifier") return;
+    if (sourceText(candidate, source) !== name) return;
+    if (bindingLeft !== null && isDescendantOf(candidate, bindingLeft)) return;
+    used = true;
+  });
+  return used;
+}
+
+function isDescendantOf(node: Node, ancestor: Node): boolean {
+  let current: Node | null = node;
+  while (current !== null) {
+    if (current.id === ancestor.id) return true;
+    current = current.parent;
+  }
+  return false;
 }
 
 function analyzeChannels(file: SourceRevision, body: Node, signals: Signal[]): void {
@@ -201,6 +333,193 @@ function analyzeChannels(file: SourceRevision, body: Node, signals: Signal[]): v
       }
     }
   }
+}
+
+function analyzeLoopVarCapture(file: SourceRevision, body: Node, signals: Signal[]): void {
+  for (const forStatement of descendants(body, "for_statement")) {
+    const loopVars = loopVariableNames(forStatement, file.current);
+    if (loopVars.size === 0) continue;
+    const forBody = forStatement.childForFieldName("body") ?? forStatement.namedChildren.find((node) => node.type === "block");
+    if (forBody === undefined || forBody === null) continue;
+    const statements = forBody.namedChildren.find((node) => node.type === "statement_list")?.namedChildren
+      ?? forBody.namedChildren;
+
+    for (let index = 0; index < statements.length; index += 1) {
+      const statement = statements[index]!;
+      if (statement.type !== "go_statement") continue;
+      const call = statement.namedChildren.find((node) => node.type === "call_expression");
+      const literal = call?.childForFieldName("function");
+      if (literal === undefined || literal === null || literal.type !== "func_literal") continue;
+
+      const paramNames = new Set(
+        descendants(literal.childForFieldName("parameters") ?? literal, "parameter_declaration")
+          .flatMap((parameter) => parameter.namedChildren
+            .filter((node) => node.type === "identifier")
+            .map((node) => sourceText(node, file.current))),
+      );
+
+      const previous = index > 0 ? statements[index - 1] : undefined;
+      const shadowed = previous === undefined ? new Set<string>() : shadowingNames(previous, file.current, loopVars);
+
+      for (const loopVar of loopVars) {
+        if (paramNames.has(loopVar) || shadowed.has(loopVar)) continue;
+        if (!containsIdentifier(literal, file.current, loopVar)) continue;
+        signals.push(signal(file, statement, "go-concurrency.loopvar.capture",
+          `Goroutine closes over loop variable ${loopVar} without shadowing or binding it as a parameter.`,
+          { variable: loopVar, form: "go-func" }));
+        break;
+      }
+    }
+  }
+}
+
+function loopVariableNames(forStatement: Node, source: string): Set<string> {
+  const names = new Set<string>();
+  const rangeClause = forStatement.namedChildren.find((node) => node.type === "range_clause");
+  if (rangeClause !== undefined) {
+    const left = rangeClause.childForFieldName("left") ?? rangeClause.namedChildren.find((node) => node.type === "expression_list");
+    for (const child of left?.namedChildren ?? []) {
+      if (child.type === "identifier") {
+        const name = sourceText(child, source);
+        if (name !== "_") names.add(name);
+      }
+    }
+    return names;
+  }
+  const forClause = forStatement.namedChildren.find((node) => node.type === "for_clause");
+  if (forClause !== undefined) {
+    const init = forClause.childForFieldName("initializer") ?? forClause.namedChildren[0];
+    if (init?.type === "short_var_declaration") {
+      const left = init.childForFieldName("left");
+      for (const child of left?.namedChildren ?? []) {
+        if (child.type === "identifier") {
+          const name = sourceText(child, source);
+          if (name !== "_") names.add(name);
+        }
+      }
+    }
+  }
+  return names;
+}
+
+function shadowingNames(statement: Node, source: string, loopVars: Set<string>): Set<string> {
+  const shadowed = new Set<string>();
+  if (statement.type !== "short_var_declaration") return shadowed;
+  const left = statement.childForFieldName("left");
+  const right = statement.childForFieldName("right");
+  const names = left?.namedChildren.map((node) => sourceText(node, source)) ?? [];
+  const values = right?.namedChildren.map((node) => sourceText(node, source)) ?? [];
+  if (names.length !== values.length) return shadowed;
+  for (let index = 0; index < names.length; index += 1) {
+    const name = names[index]!;
+    if (loopVars.has(name) && values[index] === name) shadowed.add(name);
+  }
+  return shadowed;
+}
+
+function analyzeSelectDefaultBusy(file: SourceRevision, body: Node, signals: Signal[]): void {
+  for (const forStatement of descendants(body, "for_statement")) {
+    const forBody = forStatement.namedChildren.find((node) => node.type === "block");
+    if (forBody === undefined) continue;
+    const statements = forBody.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
+    // High precision: loop body is a single select with only default (no communication cases).
+    if (statements.length !== 1 || statements[0]?.type !== "select_statement") continue;
+    const selectNode = statements[0]!;
+    const cases = selectNode.namedChildren.filter((node) =>
+      node.type === "default_case" || node.type === "communication_case");
+    if (cases.length === 0) continue;
+    if (cases.some((node) => node.type === "communication_case")) continue;
+    if (!cases.every((node) => node.type === "default_case")) continue;
+    signals.push(signal(file, selectNode, "go-concurrency.select.default-busy",
+      "Loop body is a select with only a default case, which busy-spins the CPU.",
+      { form: "for-select-default" }));
+  }
+}
+
+function analyzeTickers(
+  file: SourceRevision,
+  fn: Node,
+  body: Node,
+  aliases: Map<string, string>,
+  signals: Signal[],
+): void {
+  const timeAlias = aliases.get("time");
+  if (timeAlias === undefined) return;
+  const functionName = functionNameOf(fn, file.current);
+
+  for (const call of descendants(body, "call_expression")) {
+    const functionNode = call.childForFieldName("function");
+    if (functionNode === null) continue;
+    const callee = sourceText(functionNode, file.current);
+    if (callee === `${timeAlias}.Tick`) {
+      signals.push(signal(file, call, "go-concurrency.ticker.not-stopped",
+        `${callee} cannot be stopped and leaks a ticker for the process lifetime.`,
+        { helper: "Tick" }));
+    }
+  }
+
+  // Process-lifetime tickers in main are an accepted FP class.
+  if (functionName === "main") return;
+
+  const tickerNames = new Map<string, Node>();
+  for (const declaration of [
+    ...descendants(body, "short_var_declaration"),
+    ...descendants(body, "assignment_statement"),
+  ]) {
+    const left = declaration.childForFieldName("left");
+    const right = declaration.childForFieldName("right");
+    const names = left?.namedChildren.map((node) => sourceText(node, file.current)) ?? [];
+    const values = right?.namedChildren ?? [];
+    if (names.length !== 1 || values.length !== 1) continue;
+    const value = values[0]!;
+    if (value.type !== "call_expression") continue;
+    const functionNode = value.childForFieldName("function");
+    if (functionNode === null) continue;
+    if (sourceText(functionNode, file.current) !== `${timeAlias}.NewTicker`) continue;
+    tickerNames.set(names[0]!, value);
+  }
+
+  for (const [name, node] of tickerNames) {
+    if (selectorCalls(body, file.current, name, "Stop").length > 0) continue;
+    signals.push(signal(file, node, "go-concurrency.ticker.not-stopped",
+      `${timeAlias}.NewTicker result ${name} is never Stopped in this function.`,
+      { helper: "NewTicker", ticker: name }));
+  }
+}
+
+function analyzeTimers(
+  file: SourceRevision,
+  body: Node,
+  aliases: Map<string, string>,
+  signals: Signal[],
+): void {
+  const timeAlias = aliases.get("time");
+  if (timeAlias === undefined) return;
+
+  for (const forStatement of descendants(body, "for_statement")) {
+    for (const call of descendants(forStatement, "call_expression")) {
+      const functionNode = call.childForFieldName("function");
+      if (functionNode === null) continue;
+      if (sourceText(functionNode, file.current) !== `${timeAlias}.After`) continue;
+      // Ignore After inside nested function literals launched from the loop.
+      if (hasNestedFunctionAncestor(call, forStatement)) continue;
+      signals.push(signal(file, call, "go-concurrency.timer.not-stopped",
+        `${timeAlias}.After inside a loop allocates a timer each iteration; prefer NewTimer with Stop/Reset.`,
+        { helper: "After", form: "in-loop" }));
+    }
+  }
+}
+
+function functionNameOf(fn: Node, source: string): string | undefined {
+  if (fn.type === "function_declaration") {
+    const name = fn.childForFieldName("name");
+    return name === null ? undefined : sourceText(name, source);
+  }
+  if (fn.type === "method_declaration") {
+    const name = fn.childForFieldName("name");
+    return name === null ? undefined : sourceText(name, source);
+  }
+  return undefined;
 }
 
 function unbufferedChannelDeclaration(statement: Node, source: string): { name: string } | undefined {
