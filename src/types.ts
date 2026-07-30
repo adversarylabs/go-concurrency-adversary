@@ -5,16 +5,28 @@ export interface SourceRevision {
   status: "added" | "modified" | "repository";
 }
 
+export interface GoVersion {
+  major: number;
+  minor: number;
+}
+
 export interface Discovery {
   mode: "diff" | "repository";
   base?: string;
   files: SourceRevision[];
+  goVersion?: GoVersion;
 }
 
 export interface Signal {
   ruleId:
     | "go-concurrency.waitgroup.lifecycle"
+    | "go-concurrency.waitgroup.copied"
+    | "go-concurrency.mutex.copy"
+    | "go-concurrency.loopvar.capture"
     | "go-concurrency.context.cancellation"
+    | "go-concurrency.select.default-busy"
+    | "go-concurrency.ticker.not-stopped"
+    | "go-concurrency.timer.not-stopped"
     | "go-concurrency.channel.self-deadlock";
   path: string;
   line: number;
@@ -35,8 +47,8 @@ export interface Analysis {
   mode: Discovery["mode"];
   base?: string;
   filesScanned: number;
+  goVersion?: GoVersion;
   signals: Signal[];
   positives: PositiveSignal[];
   parseErrors: Array<{ path: string; message: string }>;
 }
-
