@@ -1,56 +1,45 @@
-# Go Concurrency adversary
+# go/concurrency
 
-Go Concurrency reviews Go code for concurrency behavior an experienced Go engineer would block: lifecycle races, cancellation ownership mistakes, deadlocks, and unsafe channel or synchronization patterns.
+**go/concurrency** reviews Go concurrency for lifecycle races, cancellation ownership mistakes, WaitGroup misuse, and unsafe channel or synchronization patterns an experienced Go engineer would block.
 
-It is built around one review question:
+It is a **concurrency domain reviewer**, not a general race detector or linter. It prefers silence over speculative warnings. When it reports, the concurrent work cannot start, stop, fail, or complete predictably.
 
-> Can this concurrent work start, stop, fail, and complete predictably?
+## What it does
 
-The adversary parses Go with the official Tree-sitter Go grammar. It does not execute the target repository and does not report findings from raw text matches.
+1. **Discovers** non-test Go files (`*.go`, excluding `*_test.go`).
+2. **Parses** with Tree-sitter Go and runs structural detectors with stable rule ids.
+3. **Synthesizes a review** focused on lifecycle ownership.
+4. Optionally **enhances** with a model when provided — ranking and explanation only.
 
-> Architecture note: the current parser and repository discovery are transitional. The target design makes the runtime responsible for context preparation and leaves this adversary responsible for expert concurrency judgment. See [ReviewContext capability discovery](docs/review-context-capabilities.md).
+It never executes the scanned project as the product under review, never installs dependencies into it, and never needs network access to the target repository.
 
-## Initial rules
+## What it detects
 
-| Rule | Review question |
+Every **shipped rule id**, severity, and short description lives in **[CHECKS.md](CHECKS.md)** — the audit surface for “what does this adversary look for?”
+
+Highlights:
+
+| Area | Examples |
 | --- | --- |
-| `go-concurrency.waitgroup.lifecycle` | Is work registered before goroutine launch so `Wait` cannot race ahead? |
-| `go-concurrency.context.cancellation` | Does the owner retain cancellation functions and propagate errgroup cancellation? |
-| `go-concurrency.channel.self-deadlock` | Can a newly created local unbuffered channel reach a concurrent peer? |
+| Cancellation | Unused cancel functions; context not derived for child work |
+| WaitGroup | Add inside goroutine; WaitGroup copied by value; lifecycle races |
+| Channels | Self-deadlock patterns; busy `select` with default |
+| Timers | `time.Ticker` / `Timer` not stopped |
+| Loops | Loop variable capture in goroutines |
+| Mutex | Mutex copied by value |
 
-Related evidence is grouped into one remediation. A deterministic local-channel deadlock or WaitGroup lifecycle race drives the overall risk; finding counts do not.
+### Ownership boundaries
 
-The intentionally small first rule set leaves broad judgments such as “this goroutine may leak” out until calibration can establish ownership and lifecycle with low false-positive rates.
+Other official adversaries own adjacent classes so findings stay non-duplicative:
 
-## Fixtures and calibration
+| Concern | Owned by |
+| --- | --- |
+| CLI process/subprocess cancellation at the command boundary | [`go/cli`](https://github.com/adversarylabs/go-cli-adversary) |
+| HTTP server/client timeouts and request contexts | [`go/http`](https://github.com/adversarylabs/go-http-adversary) |
+| DB rows/transaction lifecycle | [`go/database`](https://github.com/adversarylabs/go-database-adversary) |
 
-`fixtures/` contains five repository-level examples:
+## Precision stance
 
-- `excellent`: explicit cancellation ownership and ordered WaitGroup lifecycle
-- `good`: bounded waiting with cancellation
-- `average`: a contained cancellation ownership defect
-- `poor`: a WaitGroup registration race
-- `terrible`: cancellation loss, lifecycle race, and deterministic deadlock
-
-Each fixture owns `expected.review.json`, which snapshots the assessment, grouped findings, evidence, recommendations, positives, and ship opinion.
-
-`benchmarks/corpus.json` indexes 61 verified open-source Go repositories. The repositories are calibration inputs only; their source is not copied or shipped.
-
-## Automatic detection
-
-`adversary auto` selects Go Concurrency when Go source changes. The v1 manifest uses the canonical SDK `detection.files` field. A future programmatic detector can narrow selection to concurrency-relevant syntax once the SDK exports the detector runtime types; the adversary does not duplicate that contract locally.
-
-## Development
-
-```sh
-npm install
-npm test
-adversary validate .
-adversary pack --check .
-```
-
-The release artifact bundles the SDK and parser runtime and ships the Tree-sitter runtime and Go grammar as two WASM assets. It does not require `node_modules` at execution time.
-
-## Issue catalog
-
-What this adversary targets (P0 / P1 / LLM-only priorities, detection notes, and public pattern references) is documented in [docs/issue-catalog.md](docs/issue-catalog.md).
+- **High confidence** only for deterministic, evidence-backed patterns.
+- Clean fixtures must stay quiet; vulnerable fixtures must fire where graded fixtures exist.
+- Prefer missing a weak signal over a false positive on normal production code.
