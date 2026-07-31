@@ -50,3 +50,7 @@ adversary pack --check .
 ```
 
 The release artifact bundles the SDK and parser runtime and ships the Tree-sitter runtime and Go grammar as two WASM assets. It does not require `node_modules` at execution time.
+
+## Issue catalog
+
+What this adversary targets (P0 / P1 / LLM-only priorities, detection notes, and public pattern references) is documented in [docs/issue-catalog.md](docs/issue-catalog.md).
