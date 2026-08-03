@@ -4,7 +4,7 @@ import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { Adversary } from "@adversarylabs/sdk";
 import { analyzeDiscovery } from "./analyze.js";
-import { discoverGoSources } from "./discover.js";
+import { discoverSources } from "./discover.js";
 import { reviewConcurrency } from "./review.js";
 
 export function createApp(): Adversary {
@@ -15,7 +15,7 @@ export function createApp(): Adversary {
   });
 
   app.rule("go-concurrency.review", async (ctx) => {
-    const discovery = await discoverGoSources(ctx.repoPath, ctx.change);
+    const discovery = await discoverSources(ctx);
     const analysis = await analyzeDiscovery(discovery);
     ctx.summary.files_scanned = analysis.filesScanned;
     ctx.review.observe({
