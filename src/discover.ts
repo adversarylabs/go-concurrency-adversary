@@ -1,217 +1,56 @@
-import { execFile } from "node:child_process";
-import { readFile, readdir } from "node:fs/promises";
-import { join, sep } from "node:path";
-import { promisify } from "node:util";
-import { type ChangeContext } from "@adversarylabs/sdk";
-import { type Discovery, type GoVersion, type SourceRevision } from "./types.js";
+import type { ChangeContext, RuleContext } from "@adversarylabs/sdk";
+import { type Discovery, type SourceRevision } from "./types.js";
 
-const execute = promisify(execFile);
-const IGNORED_DIRECTORIES = new Set([
-  ".git", "build", "dist", "generated", "node_modules", "third_party", "vendor",
-]);
 const MAX_FILE_BYTES = 750_000;
 const MAX_FILES = 750;
 
+function includePath(path: string): boolean {
+  return path.endsWith(".go");
+}
+
+export async function discoverSources(ctx: RuleContext): Promise<Discovery> {
+  const sources = await ctx.loadInScopeSources({
+    include: includePath,
+    limit: MAX_FILES,
+    maxBytes: MAX_FILE_BYTES,
+  });
+
+  const wholeTarget = ctx.change === null || ctx.change.scanMode === "all";
+  const files: SourceRevision[] = sources.map((source) => ({
+    path: source.path,
+    current: source.content,
+    changedLines: new Set<number>(),
+    status: source.status === "repository" ? "repository" : "added",
+  }));
+
+  return {
+    mode: wholeTarget ? "repository" : "diff",
+    ...(ctx.change?.baseRef === undefined ? {} : { base: ctx.change.baseRef }),
+    files,
+  };
+}
+
+/** @deprecated use discoverSources(ctx) */
 export async function discoverGoSources(
   repoPath: string,
   change: ChangeContext | null,
 ): Promise<Discovery> {
-  const goVersion = await readGoVersion(repoPath);
-  if (!(await isGitRepository(repoPath)) || !(await revisionExists(repoPath, "HEAD"))) {
-    return withGoVersion(
-      { mode: "repository", files: await readSources(repoPath, await repositoryFiles(repoPath)) },
-      goVersion,
-    );
-  }
-
-  // Explicit whole-target reviews must not collapse to a tiny incidental diff.
-  if (change !== null && change.scanMode === "all") {
-    return withGoVersion(await trackedRepository(repoPath), goVersion);
-  }
-
-  if (change !== null && change.scanMode === "changed" &&
-    change.baseRef !== undefined && (await revisionExists(repoPath, change.baseRef))) {
-    const head = change.worktree ? [] : ["HEAD"];
-    const names = await gitOutput(
-      repoPath,
-      ["diff", "--name-status", "--find-renames", change.baseRef, ...head, "--"],
-    );
-    return withGoVersion(await diffDiscovery(repoPath, change.baseRef, names), goVersion);
-  }
-
-  // Auto: dirty worktree vs HEAD, then branch base vs HEAD, else whole repository.
-  const worktree = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", "HEAD", "--"]);
-  if (worktree.trim() !== "") return withGoVersion(await diffDiscovery(repoPath, "HEAD", worktree), goVersion);
-
-  const base = await chooseBase(repoPath);
-  if (base !== undefined) {
-    const names = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", base, "HEAD", "--"]);
-    if (names.trim() !== "") return withGoVersion(await diffDiscovery(repoPath, base, names), goVersion);
-  }
-
-  return withGoVersion(await trackedRepository(repoPath), goVersion);
-}
-
-function withGoVersion(discovery: Discovery, goVersion: GoVersion | undefined): Discovery {
-  return goVersion === undefined ? discovery : { ...discovery, goVersion };
-}
-
-async function readGoVersion(repoPath: string): Promise<GoVersion | undefined> {
-  const content = await safeRead(join(repoPath, "go.mod"));
-  if (content === undefined) return undefined;
-  const match = /^go\s+(\d+)\.(\d+)\b/m.exec(content);
-  if (match === null) return undefined;
-  return { major: Number(match[1]), minor: Number(match[2]) };
-}
-
-async function trackedRepository(repoPath: string): Promise<Discovery> {
-  const paths = (await gitOutput(repoPath, ["ls-files", "-z"]))
-    .split("\0").filter((path) => isGoSource(path)).slice(0, MAX_FILES);
-  return { mode: "repository", files: await readSources(repoPath, paths) };
-}
-
-async function diffDiscovery(repoPath: string, base: string, names: string): Promise<Discovery> {
-  const records = parseNameStatus(names)
-    .filter((record) => record.status !== "D" && isGoSource(record.path))
-    .slice(0, MAX_FILES);
-  const files: SourceRevision[] = [];
-  for (const record of records) {
-    const current = await safeRead(join(repoPath, record.path));
-    if (current === undefined) continue;
-    files.push({
-      path: record.path,
-      current,
-      changedLines: await changedLineNumbers(repoPath, base, record.path),
-      status: record.status === "A" ? "added" : "modified",
-    });
-  }
-  return { mode: "diff", base, files };
-}
-
-async function readSources(repoPath: string, paths: string[]): Promise<SourceRevision[]> {
-  const files: SourceRevision[] = [];
-  for (const path of paths) {
-    const current = await safeRead(join(repoPath, path));
-    if (current === undefined) continue;
-    files.push({ path, current, changedLines: new Set(), status: "repository" });
-  }
-  return files;
-}
-
-async function repositoryFiles(repoPath: string): Promise<string[]> {
-  const files: string[] = [];
-  async function visit(directory: string): Promise<void> {
-    if (files.length >= MAX_FILES) return;
-    let entries;
-    try {
-      entries = await readdir(join(repoPath, directory), { withFileTypes: true });
-    } catch {
-      return;
-    }
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
-      if (files.length >= MAX_FILES) return;
-      const relativePath = directory === "" ? entry.name : join(directory, entry.name);
-      const posix = relativePath.split(sep).join("/");
-      if (entry.isDirectory()) {
-        if (!IGNORED_DIRECTORIES.has(entry.name)) await visit(posix);
-        continue;
-      }
-      if (isGoSource(posix)) files.push(posix);
-    }
-  }
-  await visit("");
-  return files;
-}
-
-async function changedLineNumbers(repoPath: string, base: string, path: string): Promise<Set<number>> {
-  const lines = new Set<number>();
-  try {
-    const patch = await gitOutput(repoPath, ["diff", "--unified=0", base, "--", path]);
-    let newLine = 0;
-    for (const line of patch.split("\n")) {
-      const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
-      if (header) {
-        newLine = Number(header[1]);
-        continue;
-      }
-      if (line.startsWith("+") && !line.startsWith("+++")) {
-        lines.add(newLine);
-        newLine += 1;
-      } else if (line.startsWith("-") && !line.startsWith("---")) {
-        // removed lines do not advance newLine
-      } else if (!line.startsWith("\\")) {
-        newLine += 1;
-      }
-    }
-  } catch {
-    // treat as fully changed
-  }
-  return lines;
-}
-
-function parseNameStatus(names: string): Array<{ status: string; path: string }> {
-  return names
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const parts = line.split("\t");
-      const status = (parts[0] ?? "M")[0] ?? "M";
-      const path = parts.length > 2 ? parts[2]! : parts[1] ?? "";
-      return { status, path };
-    })
-    .filter((record) => record.path.length > 0);
-}
-
-async function chooseBase(repoPath: string): Promise<string | undefined> {
-  for (const candidate of ["main", "master", "trunk", "origin/main", "origin/master"]) {
-    if (await revisionExists(repoPath, candidate)) {
-      const head = await gitOutput(repoPath, ["rev-parse", "HEAD"]);
-      const base = await gitOutput(repoPath, ["rev-parse", candidate]);
-      if (head.trim() !== base.trim()) return candidate;
-    }
-  }
-  return undefined;
-}
-
-async function isGitRepository(repoPath: string): Promise<boolean> {
-  try {
-    await gitOutput(repoPath, ["rev-parse", "--is-inside-work-tree"]);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function revisionExists(repoPath: string, rev: string): Promise<boolean> {
-  try {
-    await gitOutput(repoPath, ["rev-parse", "--verify", rev]);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function gitOutput(repoPath: string, args: string[]): Promise<string> {
-  const { stdout } = await execute("git", ["-C", repoPath, ...args], {
-    maxBuffer: 20 * 1024 * 1024,
-    encoding: "utf8",
+  // Fallback adapter for old call sites — prefer RuleContext form.
+  const { loadInScopeSources } = await import("@adversarylabs/sdk");
+  const sources = await loadInScopeSources(repoPath, change, {
+    include: includePath,
+    limit: MAX_FILES,
+    maxBytes: MAX_FILE_BYTES,
   });
-  return stdout;
-}
-
-async function safeRead(path: string): Promise<string | undefined> {
-  try {
-    const buffer = await readFile(path);
-    if (buffer.byteLength > MAX_FILE_BYTES) return undefined;
-    if (buffer.includes(0)) return undefined;
-    return buffer.toString("utf8");
-  } catch {
-    return undefined;
-  }
-}
-
-function isGoSource(path: string): boolean {
-  return path.endsWith(".go") && !path.endsWith("_test.go");
+  const wholeTarget = change === null || change.scanMode === "all";
+  return {
+    mode: wholeTarget ? "repository" : "diff",
+    ...(change?.baseRef === undefined ? {} : { base: change.baseRef }),
+    files: sources.map((source) => ({
+      path: source.path,
+      current: source.content,
+      changedLines: new Set<number>(),
+      status: source.status === "repository" ? "repository" : "added",
+    })),
+  };
 }

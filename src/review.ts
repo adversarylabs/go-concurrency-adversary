@@ -1,5 +1,6 @@
 import { type RuleContext } from "@adversarylabs/sdk";
 import { runModelConcurrencyReview, type DiscoveryFile } from "./model-review.js";
+import { attachImportNavigation } from "./navigation.js";
 import { type Analysis, type GoVersion, type Signal } from "./types.js";
 
 export async function reviewConcurrency(
@@ -124,6 +125,8 @@ export async function reviewConcurrency(
     tickers.length > 0 ? "tickers without Stop" :
     timers.length > 0 ? "time.After inside loops" :
     undefined;
+  await attachImportNavigation(ctx, analysis);
+
   const modelStatus = await runModelConcurrencyReview(
     ctx,
     analysis,

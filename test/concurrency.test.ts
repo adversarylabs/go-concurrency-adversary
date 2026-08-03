@@ -105,7 +105,7 @@ func configured() server {
   assert.equal(output.findings.some((finding) => finding.ruleId === "go-concurrency.channel.self-deadlock"), false);
 });
 
-test("only reports evidence on changed lines in diff mode", async () => {
+test("only reviews CLI-scoped changed files in diff mode", async () => {
   const root = await repository(`package sample
 import "context"
 func old(parent context.Context) context.Context {
@@ -113,14 +113,21 @@ func old(parent context.Context) context.Context {
   return ctx
 }
 `);
-  await execute("git", ["init", "-q"], { cwd: root });
-  await execute("git", ["config", "user.email", "concurrency@example.test"], { cwd: root });
-  await execute("git", ["config", "user.name", "Concurrency Tests"], { cwd: root });
-  await execute("git", ["add", "."], { cwd: root });
-  await execute("git", ["commit", "-qm", "baseline"], { cwd: root });
   await writeFile(join(root, "new.go"), "package sample\n\nconst Added = true\n");
-  await execute("git", ["add", "new.go"], { cwd: root });
-  const output = await review(root);
+  // Platform owns scope: when the CLI only lists new.go, baseline issues stay out of review.
+  const output = await createApp().run({
+    input: {
+      source: { path: root },
+      change: {
+        type: "diff",
+        base_ref: "HEAD",
+        head_ref: "WORKTREE",
+        scan_mode: "changed",
+        changed_files: ["new.go"],
+      },
+    },
+    includeRawObservations: true,
+  });
   assert.deepEqual(output.findings, []);
 });
 
