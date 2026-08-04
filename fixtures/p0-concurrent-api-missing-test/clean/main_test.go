@@ -1,27 +1,42 @@
 package main
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 )
 
 func TestOverlappingCalls(t *testing.T) {
-	p := &batchProcessor{}
 	var active int32
-	// instrumented fake with active counter to assert serialization
+	// instrumented fake: count inside the call "body" (critical section) so it tracks
+	// execution overlap of the protected API, not just launch overlap.
+	p := &batchProcessor{
+		Export: func(ctx interface{}) {
+			if atomic.AddInt32(&active, 1) > 1 {
+				t.Error("concurrent call detected")
+			}
+			defer atomic.AddInt32(&active, -1)
+			// protected work
+		},
+		ForceFlush: func() {
+			if atomic.AddInt32(&active, 1) > 1 {
+				t.Error("concurrent call detected")
+			}
+			defer atomic.AddInt32(&active, -1)
+			// flush
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		if atomic.AddInt32(&active, 1) > 1 {
-			t.Error("concurrent call detected")
-		}
-		defer atomic.AddInt32(&active, -1)
+		defer wg.Done()
 		p.Export(nil)
 	}()
 	go func() {
-		if atomic.AddInt32(&active, 1) > 1 {
-			t.Error("concurrent call detected")
-		}
-		defer atomic.AddInt32(&active, -1)
+		defer wg.Done()
 		p.ForceFlush()
 	}()
-	// max active asserted via counter
+	wg.Wait()
+	// proof of max concurrency 1 is asserted via the active counter inside the API bodies
 }

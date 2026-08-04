@@ -107,10 +107,10 @@ export async function reviewConcurrency(
     title: "Concurrent API guarantee lacks test for overlapping calls",
     category: "correctness",
     severity: "medium",
-    summary: (count) => `${count} concurrent API${count === 1 ? "" : "s"} (Export/Flush/Shutdown-style) claim serialization but tests do not assert single-active execution under overlap.`,
-    whyItMatters: "Production code uses synchronization to guarantee that lifecycle methods like Export, ForceFlush, and Shutdown are never invoked concurrently, but the test harness lacks a counter or assertion that would fail on overlap.",
-    impact: "A regression can allow overlapping calls, producing races, duplicate exports, or crashes in batch processors and similar components.",
-    recommendation: "Instrument the test double with an atomic active-call counter (or blocking callback) and assert max concurrency of one while racing the lifecycle methods.",
+    summary: (count) => `${count} test${count === 1 ? "" : "s"} launch concurrent calls to lifecycle methods (Export/ForceFlush/Shutdown-style) without an active-call / max-concurrency assertion.`,
+    whyItMatters: "Tests for APIs that must not be invoked concurrently should include a harness (active counter, blocking callback, etc.) that would fail on overlap.",
+    impact: "Without an assertion that exercises the single-active guarantee, a regression removing the production guard can ship undetected.",
+    recommendation: "Instrument the test double (or wrapper) with an atomic active-call counter inside the call body and assert max concurrency of one while launching the methods concurrently from the test.",
   });
 
   addPositives(ctx, analysis);
@@ -254,7 +254,7 @@ function addAssessment(
     selectBusy: Signal[];
     tickers: Signal[];
     timers: Signal[];
-    concurrentApiMissing?: Signal[];
+    concurrentApiMissing: Signal[];
     goVersion?: GoVersion;
   },
 ): void {
@@ -362,10 +362,21 @@ function addAssessment(
     });
     return;
   }
+  if (groups.concurrentApiMissing && groups.concurrentApiMissing.length > 0) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "Tests for concurrent API guarantees (Export/ForceFlush/Shutdown-style) launch overlapping calls but lack an assertion proving single-active execution.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would add active-call counter or max-concurrency assertion inside the test harness before merging.",
+    });
+    return;
+  }
   ctx.review.assessment({
     risk: "none",
     summary: "No high-confidence concurrency lifecycle defects were found in the reviewed Go code.",
-  });
+    });
   ctx.review.opinion({
     ship: true,
     summary: "I would approve the concurrency lifecycle represented by the reviewed code.",

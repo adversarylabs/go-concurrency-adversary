@@ -118,7 +118,7 @@ Regression entry: graded fixtures and corpus under `test/`.
 | | |
 | --- | --- |
 | **What** | Concurrent API guarantee lacks test for overlapping calls |
-| **Why** | Tests for serialized Export/Flush/Shutdown etc. must prove single-active execution |
-| **Looks for** | Lifecycle methods protected by locks with concurrent calls in tests that lack active-call counters or max-concurrency assertions |
-| **Stays quiet when** | Tests use atomic active counters (or equivalent) and assert max concurrency of 1 under overlap |
+| **Why** | Tests for serialized Export/ForceFlush/Shutdown-style APIs must prove single-active execution under overlap |
+| **Looks for** | Test files with 2+ concurrent `go` launches of lifecycle selectors (Export/ForceFlush/Shutdown/OnEmit) whose enclosing Test func lacks structural proof (atomic.Add* >1 check + error, etc.) |
+| **Stays quiet when** | The same Test func containing the concurrent launches has an active counter (atomic inside call body) or equivalent max-concurrency assertion |
 | **Remediation** | Add instrumentation and assertion in the test double for the serialization invariant |

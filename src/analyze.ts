@@ -609,46 +609,119 @@ function importAliases(root: Node, source: string): Map<string, string> {
   return result;
 }
 
+function findEnclosingFunction(node: Node | null): Node | null {
+  let cur: Node | null = node;
+  while (cur !== null) {
+    if (cur.type === "function_declaration" || cur.type === "method_declaration") {
+      return cur;
+    }
+    cur = cur.parent ?? null;
+  }
+  return null;
+}
+
+function hasSerializationProofInFunc(fn: Node, source: string): boolean {
+  const body = fn.childForFieldName("body");
+  if (body === null) return false;
+
+  // Structural atomic active counter patterns inside this func (e.g. around lifecycle calls)
+  const calls = descendants(body, "call_expression");
+  for (const call of calls) {
+    const fnNode = call.childForFieldName("function");
+    if (fnNode === null) continue;
+    const fnText = sourceText(fnNode, source);
+    if (fnText.includes("AddInt32") || fnText.includes("AddInt64") || /atomic\s*\.\s*Add/.test(fnText)) {
+      return true;
+    }
+    if (fnNode.type === "selector_expression") {
+      const field = fnNode.childForFieldName("field");
+      if (field !== null) {
+        const fieldText = sourceText(field, source);
+        if (fieldText === "AddInt32" || fieldText === "AddInt64" || fieldText === "Add") {
+          const operand = fnNode.childForFieldName("operand");
+          if (operand !== null) {
+            const opText = sourceText(operand, source);
+            if (opText.includes("atomic") || opText.includes("Add")) {
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // active > 1 style checks
+  for (const be of descendants(body, "binary_expression")) {
+    const txt = sourceText(be, source).toLowerCase().replace(/\s+/g, "");
+    if (txt.includes("active") && (txt.includes(">1") || txt.includes(">=2"))) {
+      return true;
+    }
+  }
+
+  // t.Error / assert on concurrent/overlap/serial inside this func
+  for (const call of calls) {
+    const fnNode = call.childForFieldName("function");
+    if (fnNode === null) continue;
+    const callText = sourceText(call, source).toLowerCase();
+    const fnText = sourceText(fnNode, source).toLowerCase();
+    if ((fnText.includes("error") || fnText.includes("fatal") || fnText.includes("assert")) &&
+        (callText.includes("concurrent") || callText.includes("overlap") || callText.includes("serial") || callText.includes("max"))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function analyzeMissingSerializationTest(file: SourceRevision, root: Node, signals: Signal[]): void {
   const source = file.current;
-  const LIFECYCLE = new Set(["Export", "ForceFlush", "Shutdown", "OnEmit", "Flush"]);
+  const LIFECYCLE = new Set(["Export", "ForceFlush", "Shutdown", "OnEmit"]);
 
-  // Look for go statements that invoke lifecycle methods concurrently
+  // Look for go statements that invoke lifecycle methods concurrently.
+  // Require at least two distinct launch sites (overlapping calls) rather than any single
+  // fire-and-forget go p.XXX(). Flush is excluded as too common a method name.
   const goStmts = descendants(root, "go_statement");
-  let hasConcurrentLifecycleCall = false;
+  const lifecycleLaunches: Node[] = [];
   for (const goStmt of goStmts) {
     for (const call of descendants(goStmt, "call_expression")) {
       const fnNode = call.childForFieldName("function");
       if (fnNode?.type === "selector_expression") {
         const selected = fnNode.childForFieldName("field");
         if (selected && LIFECYCLE.has(sourceText(selected, source))) {
-          hasConcurrentLifecycleCall = true;
+          lifecycleLaunches.push(goStmt);
           break;
         }
       }
     }
-    if (hasConcurrentLifecycleCall) break;
   }
-  if (!hasConcurrentLifecycleCall) return;
+  if (lifecycleLaunches.length < 2) return;
 
-  // Does the test source contain instrumentation proving the serialization guarantee?
-  const lower = source.toLowerCase();
-  const hasProof =
-    lower.includes("atomic") ||
-    lower.includes("addint32") ||
-    lower.includes("addint64") ||
-    (lower.includes("active") && (lower.includes("max") || lower.includes("count") || lower.includes("concurrent"))) ||
-    lower.includes("maxactive") ||
-    lower.includes("single-flight") ||
-    lower.includes("max-active") ||
-    (lower.includes("assert") && (lower.includes("concurrent") || lower.includes("overlap") || lower.includes("serial")));
+  // Find the test function(s) containing the launches. Proof must be inside same test func
+  // (structural atomic counter, >1 check + error, etc), not loose file-wide keywords.
+  const relevantTestFns: Node[] = [];
+  for (const launch of lifecycleLaunches) {
+    const fn = findEnclosingFunction(launch);
+    if (fn !== null) {
+      const nameNode = fn.childForFieldName("name");
+      if (nameNode && sourceText(nameNode, source).startsWith("Test")) {
+        relevantTestFns.push(fn);
+      }
+    }
+  }
 
+  let hasProof = false;
+  for (const testFn of relevantTestFns) {
+    if (hasSerializationProofInFunc(testFn, source)) {
+      hasProof = true;
+      break;
+    }
+  }
   if (hasProof) return;
 
-  // Emit finding pointing at the first concurrent call site
-  const evidenceNode = goStmts.length > 0 ? goStmts[0]! : root;
+  // Emit finding pointing at a concrete concurrent launch site
+  const evidenceNode = lifecycleLaunches[0]!;
   signals.push(signal(file, evidenceNode, "go-concurrency.concurrent-api.missing-test",
-    "Test races concurrent calls to lifecycle API (Export/Flush/Shutdown-style) but lacks active-call counter or max-concurrency assertion proving the serialization guarantee.",
+    "Test races concurrent calls to lifecycle API (Export/ForceFlush/Shutdown-style) but lacks active-call counter or max-concurrency assertion proving the serialization guarantee.",
     { form: "missing-serialization-test" }));
 }
 
