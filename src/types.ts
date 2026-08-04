@@ -27,7 +27,8 @@ export interface Signal {
     | "go-concurrency.select.default-busy"
     | "go-concurrency.ticker.not-stopped"
     | "go-concurrency.timer.not-stopped"
-    | "go-concurrency.channel.self-deadlock";
+    | "go-concurrency.channel.self-deadlock"
+    | "go-concurrency.concurrent-api.missing-test";
   path: string;
   line: number;
   endLine?: number;

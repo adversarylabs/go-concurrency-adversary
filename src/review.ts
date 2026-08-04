@@ -17,6 +17,7 @@ export async function reviewConcurrency(
   const selectBusy = matching(analysis, "go-concurrency.select.default-busy");
   const tickers = matching(analysis, "go-concurrency.ticker.not-stopped");
   const timers = matching(analysis, "go-concurrency.timer.not-stopped");
+  const concurrentApiMissing = matching(analysis, "go-concurrency.concurrent-api.missing-test");
 
   emitGroupedFinding(ctx, deadlocks, {
     title: "A local unbuffered channel blocks before a peer can run",
@@ -102,6 +103,16 @@ export async function reviewConcurrency(
     recommendation: "Use time.NewTimer with Reset/Stop in the loop, or restructure to a single timer outside the loop.",
   });
 
+  emitGroupedFinding(ctx, concurrentApiMissing, {
+    title: "Concurrent API guarantee lacks test for overlapping calls",
+    category: "correctness",
+    severity: "medium",
+    summary: (count) => `${count} concurrent API${count === 1 ? "" : "s"} (Export/Flush/Shutdown-style) claim serialization but tests do not assert single-active execution under overlap.`,
+    whyItMatters: "Production code uses synchronization to guarantee that lifecycle methods like Export, ForceFlush, and Shutdown are never invoked concurrently, but the test harness lacks a counter or assertion that would fail on overlap.",
+    impact: "A regression can allow overlapping calls, producing races, duplicate exports, or crashes in batch processors and similar components.",
+    recommendation: "Instrument the test double with an atomic active-call counter (or blocking callback) and assert max concurrency of one while racing the lifecycle methods.",
+  });
+
   addPositives(ctx, analysis);
 
   const staticSeverities: Array<"none" | "low" | "medium" | "high" | "critical"> = [];
@@ -114,6 +125,7 @@ export async function reviewConcurrency(
   if (selectBusy.length > 0) staticSeverities.push("medium");
   if (tickers.length > 0) staticSeverities.push("medium");
   if (timers.length > 0) staticSeverities.push(timerSeverity(analysis.goVersion));
+  if (concurrentApiMissing.length > 0) staticSeverities.push("medium");
   const staticPrimaryConcern =
     deadlocks.length > 0 ? "local channel self-deadlocks" :
     mutexCopy.length > 0 ? "copied mutex values" :
@@ -124,6 +136,7 @@ export async function reviewConcurrency(
     selectBusy.length > 0 ? "busy-spinning select defaults" :
     tickers.length > 0 ? "tickers without Stop" :
     timers.length > 0 ? "time.After inside loops" :
+    concurrentApiMissing.length > 0 ? "missing tests for concurrent API serialization" :
     undefined;
   await attachImportNavigation(ctx, analysis);
 
@@ -147,6 +160,7 @@ export async function reviewConcurrency(
     selectBusy,
     tickers,
     timers,
+    concurrentApiMissing,
     ...(analysis.goVersion === undefined ? {} : { goVersion: analysis.goVersion }),
   });
 }
@@ -240,6 +254,7 @@ function addAssessment(
     selectBusy: Signal[];
     tickers: Signal[];
     timers: Signal[];
+    concurrentApiMissing?: Signal[];
     goVersion?: GoVersion;
   },
 ): void {

@@ -41,6 +41,9 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
     ]) {
       analyzeFunction(file, fn, aliases, signals, positives);
     }
+    if (file.path.endsWith("_test.go")) {
+      analyzeMissingSerializationTest(file, tree.rootNode, signals);
+    }
     return {
       signals: signals.filter((item) => isChangedEvidence(file, item.line, item.endLine)),
       positives: positives.filter((item) => isChangedEvidence(file, item.line)),
@@ -604,6 +607,49 @@ function importAliases(root: Node, source: string): Map<string, string> {
     result.set(path, match[1] ?? path.split("/").at(-1)!);
   }
   return result;
+}
+
+function analyzeMissingSerializationTest(file: SourceRevision, root: Node, signals: Signal[]): void {
+  const source = file.current;
+  const LIFECYCLE = new Set(["Export", "ForceFlush", "Shutdown", "OnEmit", "Flush"]);
+
+  // Look for go statements that invoke lifecycle methods concurrently
+  const goStmts = descendants(root, "go_statement");
+  let hasConcurrentLifecycleCall = false;
+  for (const goStmt of goStmts) {
+    for (const call of descendants(goStmt, "call_expression")) {
+      const fnNode = call.childForFieldName("function");
+      if (fnNode?.type === "selector_expression") {
+        const selected = fnNode.childForFieldName("field");
+        if (selected && LIFECYCLE.has(sourceText(selected, source))) {
+          hasConcurrentLifecycleCall = true;
+          break;
+        }
+      }
+    }
+    if (hasConcurrentLifecycleCall) break;
+  }
+  if (!hasConcurrentLifecycleCall) return;
+
+  // Does the test source contain instrumentation proving the serialization guarantee?
+  const lower = source.toLowerCase();
+  const hasProof =
+    lower.includes("atomic") ||
+    lower.includes("addint32") ||
+    lower.includes("addint64") ||
+    (lower.includes("active") && (lower.includes("max") || lower.includes("count") || lower.includes("concurrent"))) ||
+    lower.includes("maxactive") ||
+    lower.includes("single-flight") ||
+    lower.includes("max-active") ||
+    (lower.includes("assert") && (lower.includes("concurrent") || lower.includes("overlap") || lower.includes("serial")));
+
+  if (hasProof) return;
+
+  // Emit finding pointing at the first concurrent call site
+  const evidenceNode = goStmts.length > 0 ? goStmts[0]! : root;
+  signals.push(signal(file, evidenceNode, "go-concurrency.concurrent-api.missing-test",
+    "Test races concurrent calls to lifecycle API (Export/Flush/Shutdown-style) but lacks active-call counter or max-concurrency assertion proving the serialization guarantee.",
+    { form: "missing-serialization-test" }));
 }
 
 function signal(

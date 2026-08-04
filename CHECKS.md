@@ -112,3 +112,13 @@ Regression entry: graded fixtures and corpus under `test/`.
 | **Looks for** | Goroutines without ctx/stop channel |
 | **Stays quiet when** | Propagate cancel or stop signals |
 | **Remediation** | Every long-lived goroutine must be stoppable |
+
+### `go-concurrency.concurrent-api.missing-test`
+
+| | |
+| --- | --- |
+| **What** | Concurrent API guarantee lacks test for overlapping calls |
+| **Why** | Tests for serialized Export/Flush/Shutdown etc. must prove single-active execution |
+| **Looks for** | Lifecycle methods protected by locks with concurrent calls in tests that lack active-call counters or max-concurrency assertions |
+| **Stays quiet when** | Tests use atomic active counters (or equivalent) and assert max concurrency of 1 under overlap |
+| **Remediation** | Add instrumentation and assertion in the test double for the serialization invariant |
