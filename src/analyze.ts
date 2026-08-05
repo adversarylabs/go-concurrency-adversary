@@ -41,6 +41,9 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
     ]) {
       analyzeFunction(file, fn, aliases, signals, positives);
     }
+    if (file.path.endsWith("_test.go")) {
+      analyzeMissingSerializationTest(file, tree.rootNode, signals);
+    }
     return {
       signals: signals.filter((item) => isChangedEvidence(file, item.line, item.endLine)),
       positives: positives.filter((item) => isChangedEvidence(file, item.line)),
@@ -604,6 +607,102 @@ function importAliases(root: Node, source: string): Map<string, string> {
     result.set(path, match[1] ?? path.split("/").at(-1)!);
   }
   return result;
+}
+
+function findEnclosingFunction(node: Node | null): Node | null {
+  let cur: Node | null = node;
+  while (cur !== null) {
+    if (cur.type === "function_declaration" || cur.type === "method_declaration") {
+      return cur;
+    }
+    cur = cur.parent ?? null;
+  }
+  return null;
+}
+
+function hasSerializationProofInFunc(fn: Node, source: string): boolean {
+  const body = fn.childForFieldName("body");
+  if (body === null) return false;
+
+  const bodyText = sourceText(body, source);
+  const lower = bodyText.toLowerCase().replace(/\s+/g, "");
+
+  // Require a real active concurrency counter: atomic add on an "active" variable
+  // *plus* a max-concurrency check on the Add result (>1).
+  const hasActiveAdd = /atomic\.(AddInt32|AddInt64)\s*\([^)]*active/.test(bodyText);
+  // Match common patterns: Add...active...) > 1   or  Add... > 1
+  const hasMaxCheck = /Add(Int32|Int64)?\s*\([^)]*active[^)]*\)\s*[>]=?\s*1/.test(bodyText) ||
+                      />\s*1/.test(bodyText) && /Add.*active/.test(bodyText) ||
+                      lower.includes("active>1") || lower.includes("active>=2");
+
+  if (hasActiveAdd && hasMaxCheck) return true;
+
+  // Or an explicit failure inside the test that asserts no overlap/serialization violation.
+  // To avoid over-acceptance, only accept assert-style proof if there is also evidence
+  // of an active counter in the same Test func.
+  const hasAssertWithKeyword = (() => {
+    const calls = descendants(body, "call_expression");
+    for (const call of calls) {
+      const fnNode = call.childForFieldName("function");
+      if (fnNode === null) continue;
+      const callText = sourceText(call, source).toLowerCase();
+      const fnText = sourceText(fnNode, source).toLowerCase();
+      if ((fnText.includes("error") || fnText.includes("fatal") || fnText.includes("assert")) &&
+          (callText.includes("concurrent") || callText.includes("overlap") || callText.includes("serial"))) {
+        return true;
+      }
+    }
+    return false;
+  })();
+
+  if (hasActiveAdd && hasAssertWithKeyword) return true;
+
+  return false;
+}
+
+function analyzeMissingSerializationTest(file: SourceRevision, root: Node, signals: Signal[]): void {
+  const source = file.current;
+  const LIFECYCLE = new Set(["Export", "ForceFlush", "Shutdown", "OnEmit"]);
+
+  // Look for go statements that invoke lifecycle methods concurrently.
+  // Group by enclosing Test* function so that independent tests do not interfere.
+  const goStmts = descendants(root, "go_statement");
+  const launchesByTest = new Map<string, {fn: Node, launches: Node[]}>();
+
+  for (const goStmt of goStmts) {
+    for (const call of descendants(goStmt, "call_expression")) {
+      const fnNode = call.childForFieldName("function");
+      if (fnNode?.type === "selector_expression") {
+        const selected = fnNode.childForFieldName("field");
+        if (selected && LIFECYCLE.has(sourceText(selected, source))) {
+          const testFn = findEnclosingFunction(goStmt);
+          if (testFn !== null) {
+            const nameNode = testFn.childForFieldName("name");
+            const testName = nameNode ? sourceText(nameNode, source) : "";
+            if (testName.startsWith("Test")) {
+              if (!launchesByTest.has(testName)) {
+                launchesByTest.set(testName, {fn: testFn, launches: []});
+              }
+              launchesByTest.get(testName)!.launches.push(goStmt);
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (const entry of launchesByTest.values()) {
+    const {fn: testFn, launches} = entry;
+    if (launches.length < 2) continue;
+    if (hasSerializationProofInFunc(testFn, source)) continue;
+
+    // Emit one finding per failing Test, using the first launch site in that test as evidence
+    const evidenceNode = launches[0]!;
+    signals.push(signal(file, evidenceNode, "go-concurrency.concurrent-api.missing-test",
+      "Test races concurrent calls to lifecycle API (Export/ForceFlush/Shutdown-style) but lacks active-call counter or max-concurrency assertion proving the serialization guarantee.",
+      { form: "missing-serialization-test" }));
+  }
 }
 
 function signal(

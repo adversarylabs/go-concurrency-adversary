@@ -5,7 +5,7 @@ This file is the **public audit list** of detectors. If a rule id appears here, 
 Runtime source of truth: analysis under `src/`.
 Regression entry: graded fixtures and corpus under `test/`.
 
-**Scope:** non-test `*.go` files; Tree-sitter structural analysis.
+**Scope:** `*.go` files (Tree-sitter structural analysis). Most rules target non-test code. `go-concurrency.concurrent-api.missing-test` is deliberately `_test.go`-only (it detects missing test coverage for concurrent APIs).
 
 ---
 
@@ -112,3 +112,13 @@ Regression entry: graded fixtures and corpus under `test/`.
 | **Looks for** | Goroutines without ctx/stop channel |
 | **Stays quiet when** | Propagate cancel or stop signals |
 | **Remediation** | Every long-lived goroutine must be stoppable |
+
+### `go-concurrency.concurrent-api.missing-test`
+
+| | |
+| --- | --- |
+| **What** | Concurrent API guarantee lacks test for overlapping calls |
+| **Why** | Tests for serialized Export/ForceFlush/Shutdown-style APIs must prove single-active execution under overlap |
+| **Looks for** | Test files with 2+ concurrent `go` launches of lifecycle selectors (Export/ForceFlush/Shutdown/OnEmit) whose enclosing Test func lacks structural proof (atomic.Add* >1 check + error, etc.) |
+| **Stays quiet when** | The same Test func containing the concurrent launches has an active counter (atomic inside call body) or equivalent max-concurrency assertion |
+| **Remediation** | Add instrumentation and assertion in the test double for the serialization invariant |

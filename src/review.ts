@@ -17,6 +17,7 @@ export async function reviewConcurrency(
   const selectBusy = matching(analysis, "go-concurrency.select.default-busy");
   const tickers = matching(analysis, "go-concurrency.ticker.not-stopped");
   const timers = matching(analysis, "go-concurrency.timer.not-stopped");
+  const concurrentApiMissing = matching(analysis, "go-concurrency.concurrent-api.missing-test");
 
   emitGroupedFinding(ctx, deadlocks, {
     title: "A local unbuffered channel blocks before a peer can run",
@@ -102,6 +103,16 @@ export async function reviewConcurrency(
     recommendation: "Use time.NewTimer with Reset/Stop in the loop, or restructure to a single timer outside the loop.",
   });
 
+  emitGroupedFinding(ctx, concurrentApiMissing, {
+    title: "Concurrent API guarantee lacks test for overlapping calls",
+    category: "correctness",
+    severity: "medium",
+    summary: (count) => `${count} test${count === 1 ? "" : "s"} launch concurrent calls to lifecycle methods (Export/ForceFlush/Shutdown-style) without an active-call / max-concurrency assertion.`,
+    whyItMatters: "Tests for APIs that must not be invoked concurrently should include a harness (active counter, blocking callback, etc.) that would fail on overlap.",
+    impact: "Without an assertion that exercises the single-active guarantee, a regression removing the production guard can ship undetected.",
+    recommendation: "Instrument the test double (or wrapper) with an atomic active-call counter inside the call body and assert max concurrency of one while launching the methods concurrently from the test.",
+  });
+
   addPositives(ctx, analysis);
 
   const staticSeverities: Array<"none" | "low" | "medium" | "high" | "critical"> = [];
@@ -114,6 +125,7 @@ export async function reviewConcurrency(
   if (selectBusy.length > 0) staticSeverities.push("medium");
   if (tickers.length > 0) staticSeverities.push("medium");
   if (timers.length > 0) staticSeverities.push(timerSeverity(analysis.goVersion));
+  if (concurrentApiMissing.length > 0) staticSeverities.push("medium");
   const staticPrimaryConcern =
     deadlocks.length > 0 ? "local channel self-deadlocks" :
     mutexCopy.length > 0 ? "copied mutex values" :
@@ -124,6 +136,7 @@ export async function reviewConcurrency(
     selectBusy.length > 0 ? "busy-spinning select defaults" :
     tickers.length > 0 ? "tickers without Stop" :
     timers.length > 0 ? "time.After inside loops" :
+    concurrentApiMissing.length > 0 ? "missing tests for concurrent API serialization" :
     undefined;
   await attachImportNavigation(ctx, analysis);
 
@@ -147,6 +160,7 @@ export async function reviewConcurrency(
     selectBusy,
     tickers,
     timers,
+    concurrentApiMissing,
     ...(analysis.goVersion === undefined ? {} : { goVersion: analysis.goVersion }),
   });
 }
@@ -240,6 +254,7 @@ function addAssessment(
     selectBusy: Signal[];
     tickers: Signal[];
     timers: Signal[];
+    concurrentApiMissing: Signal[];
     goVersion?: GoVersion;
   },
 ): void {
@@ -347,10 +362,21 @@ function addAssessment(
     });
     return;
   }
+  if (groups.concurrentApiMissing && groups.concurrentApiMissing.length > 0) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "Tests for concurrent API guarantees (Export/ForceFlush/Shutdown-style) launch overlapping calls but lack an assertion proving single-active execution.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would add active-call counter or max-concurrency assertion inside the test harness before merging.",
+    });
+    return;
+  }
   ctx.review.assessment({
     risk: "none",
     summary: "No high-confidence concurrency lifecycle defects were found in the reviewed Go code.",
-  });
+    });
   ctx.review.opinion({
     ship: true,
     summary: "I would approve the concurrency lifecycle represented by the reviewed code.",
