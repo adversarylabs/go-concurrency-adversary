@@ -1,25 +1,6 @@
 package main
 
-import "sync"
-
-type batchProcessor struct {
-	mu sync.Mutex
-}
-
-func (p *batchProcessor) Export(ctx interface{}) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	// work
-}
-
-func (p *batchProcessor) ForceFlush() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	// flush
-}
-
-func (p *batchProcessor) Shutdown() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	// shutdown
-}
+// Note: No batchProcessor type here.
+// The clean test fixture defines its own instrumented double locally in main_test.go
+// to avoid redeclaration with the vulnerable fixture's production type.
+// This demonstrates a correct test that proves the serialization guarantee.

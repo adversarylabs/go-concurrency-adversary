@@ -628,25 +628,34 @@ function hasSerializationProofInFunc(fn: Node, source: string): boolean {
   const lower = bodyText.toLowerCase().replace(/\s+/g, "");
 
   // Require a real active concurrency counter: atomic add on an "active" variable
-  // *plus* a max-concurrency check (>1 or >=2) on it.
-  const hasActiveAdd = /atomic\.(AddInt32|AddInt64|Add)\s*\(&\s*active/.test(bodyText) ||
-                       /AddInt(32|64)\s*\(&\s*active/.test(bodyText);
-  const hasMaxCheck = lower.includes("active>1") || lower.includes("active>=2") || /active\s*[><=]+\s*1/.test(lower);
+  // *plus* a max-concurrency check on the Add result (>1).
+  const hasActiveAdd = /atomic\.(AddInt32|AddInt64)\s*\([^)]*active/.test(bodyText);
+  // Match common patterns: Add...active...) > 1   or  Add... > 1
+  const hasMaxCheck = /Add(Int32|Int64)?\s*\([^)]*active[^)]*\)\s*[>]=?\s*1/.test(bodyText) ||
+                      />\s*1/.test(bodyText) && /Add.*active/.test(bodyText) ||
+                      lower.includes("active>1") || lower.includes("active>=2");
 
   if (hasActiveAdd && hasMaxCheck) return true;
 
-  // Or an explicit failure inside the test that asserts no overlap/serialization violation
-  const calls = descendants(body, "call_expression");
-  for (const call of calls) {
-    const fnNode = call.childForFieldName("function");
-    if (fnNode === null) continue;
-    const callText = sourceText(call, source).toLowerCase();
-    const fnText = sourceText(fnNode, source).toLowerCase();
-    if ((fnText.includes("error") || fnText.includes("fatal") || fnText.includes("assert")) &&
-        (callText.includes("concurrent") || callText.includes("overlap") || callText.includes("serial"))) {
-      return true;
+  // Or an explicit failure inside the test that asserts no overlap/serialization violation.
+  // To avoid over-acceptance, only accept assert-style proof if there is also evidence
+  // of an active counter in the same Test func.
+  const hasAssertWithKeyword = (() => {
+    const calls = descendants(body, "call_expression");
+    for (const call of calls) {
+      const fnNode = call.childForFieldName("function");
+      if (fnNode === null) continue;
+      const callText = sourceText(call, source).toLowerCase();
+      const fnText = sourceText(fnNode, source).toLowerCase();
+      if ((fnText.includes("error") || fnText.includes("fatal") || fnText.includes("assert")) &&
+          (callText.includes("concurrent") || callText.includes("overlap") || callText.includes("serial"))) {
+        return true;
+      }
     }
-  }
+    return false;
+  })();
+
+  if (hasActiveAdd && hasAssertWithKeyword) return true;
 
   return false;
 }
