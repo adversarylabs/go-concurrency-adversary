@@ -6,10 +6,15 @@ import (
 	"testing"
 )
 
+// Clean fixture: instrumented double using func fields so the proof (atomic + >1 check + error)
+// is inside the Test func body while still representing the protected API calls.
+type batchProcessor struct {
+	Export     func(ctx interface{})
+	ForceFlush func()
+}
+
 func TestOverlappingCalls(t *testing.T) {
 	var active int32
-	// instrumented fake: count inside the call "body" (critical section) so it tracks
-	// execution overlap of the protected API, not just launch overlap.
 	p := &batchProcessor{
 		Export: func(ctx interface{}) {
 			if atomic.AddInt32(&active, 1) > 1 {
@@ -38,5 +43,4 @@ func TestOverlappingCalls(t *testing.T) {
 		p.ForceFlush()
 	}()
 	wg.Wait()
-	// proof of max concurrency 1 is asserted via the active counter inside the API bodies
 }
