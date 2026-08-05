@@ -5,7 +5,7 @@ This file is the **public audit list** of detectors. If a rule id appears here, 
 Runtime source of truth: analysis under `src/`.
 Regression entry: graded fixtures and corpus under `test/`.
 
-**Scope:** non-test `*.go` files; Tree-sitter structural analysis.
+**Scope:** `*.go` files (Tree-sitter structural analysis). Most rules target non-test code. `go-concurrency.concurrent-api.missing-test` is deliberately `_test.go`-only (it detects missing test coverage for concurrent APIs).
 
 ---
 
