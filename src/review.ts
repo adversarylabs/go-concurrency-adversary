@@ -14,6 +14,7 @@ export async function reviewConcurrency(
   const mutexCopy = matching(analysis, "go-concurrency.mutex.copy");
   const loopVars = matching(analysis, "go-concurrency.loopvar.capture");
   const cancellation = matching(analysis, "go-concurrency.context.cancellation");
+  const cancellationErrors = matching(analysis, "go-concurrency.context.error-classification");
   const selectBusy = matching(analysis, "go-concurrency.select.default-busy");
   const tickers = matching(analysis, "go-concurrency.ticker.not-stopped");
   const timers = matching(analysis, "go-concurrency.timer.not-stopped");
@@ -73,6 +74,15 @@ export async function reviewConcurrency(
     impact: "Work can outlive its owner, timers and context relationships remain live longer than necessary, and peer failures may not stop dependent operations.",
     recommendation: "Retain the cancellation function and invoke it on every exit path, and pass the errgroup-derived context to work launched by that group.",
   });
+  emitGroupedFinding(ctx, cancellationErrors, {
+    title: "Context cancellation is handled as an ordinary failure",
+    category: "reliability",
+    severity: "medium",
+    summary: (count) => `${count} context-aware operation${count === 1 ? "" : "s"} log, reject, or skip an error without first distinguishing cancellation.`,
+    whyItMatters: "Cancellation is lifecycle control flow. Treating it like an ordinary item failure can swallow shutdown, emit misleading errors, or negatively acknowledge work that should simply stop.",
+    impact: "Workers may continue after their owner cancels them, while shutdown produces spurious alerts, retries, or negative acknowledgements.",
+    recommendation: "Before ordinary error handling, return ctx.Err() when it is non-nil or classify wrapped context.Canceled/context.DeadlineExceeded with errors.Is; preserve existing handling for errors from a live context.",
+  });
   emitGroupedFinding(ctx, selectBusy, {
     title: "Select default inside a loop busy-spins",
     category: "performance",
@@ -122,6 +132,7 @@ export async function reviewConcurrency(
   if (mutexCopy.length > 0) staticSeverities.push("critical");
   if (loopVars.length > 0) staticSeverities.push("high");
   if (cancellation.length > 0) staticSeverities.push("medium");
+  if (cancellationErrors.length > 0) staticSeverities.push("medium");
   if (selectBusy.length > 0) staticSeverities.push("medium");
   if (tickers.length > 0) staticSeverities.push("medium");
   if (timers.length > 0) staticSeverities.push(timerSeverity(analysis.goVersion));
@@ -133,6 +144,7 @@ export async function reviewConcurrency(
     waitGroupCopied.length > 0 ? "WaitGroup value copies" :
     loopVars.length > 0 ? "loop variable captures in goroutines" :
     cancellation.length > 0 ? "discarded cancellation ownership" :
+    cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" :
     selectBusy.length > 0 ? "busy-spinning select defaults" :
     tickers.length > 0 ? "tickers without Stop" :
     timers.length > 0 ? "time.After inside loops" :
@@ -157,6 +169,7 @@ export async function reviewConcurrency(
     mutexCopy,
     loopVars,
     cancellation,
+    cancellationErrors,
     selectBusy,
     tickers,
     timers,
@@ -251,6 +264,7 @@ function addAssessment(
     mutexCopy: Signal[];
     loopVars: Signal[];
     cancellation: Signal[];
+    cancellationErrors: Signal[];
     selectBusy: Signal[];
     tickers: Signal[];
     timers: Signal[];
@@ -321,6 +335,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would make cancellation ownership explicit before merging.",
+    });
+    return;
+  }
+  if (groups.cancellationErrors.length > 0) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "A context-aware operation handles cancellation as an ordinary failure, which can obscure or delay shutdown.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would classify and propagate context cancellation before logging, retrying, or skipping the error.",
     });
     return;
   }
