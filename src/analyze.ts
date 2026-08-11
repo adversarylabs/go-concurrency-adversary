@@ -33,13 +33,14 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
   try {
     if (tree.rootNode.hasError) throw new Error("Go source contains syntax errors");
     const aliases = importAliases(tree.rootNode, file.current);
+    const atomicAccessors = atomicAccessorMethods(tree.rootNode, file.current, aliases);
     const signals: Signal[] = [];
     const positives: PositiveSignal[] = [];
     for (const fn of [
       ...descendants(tree.rootNode, "function_declaration"),
       ...descendants(tree.rootNode, "method_declaration"),
     ]) {
-      analyzeFunction(file, fn, aliases, signals, positives);
+      analyzeFunction(file, fn, aliases, atomicAccessors, signals, positives);
     }
     if (file.path.endsWith("_test.go")) {
       analyzeMissingSerializationTest(file, tree.rootNode, signals);
@@ -65,6 +66,7 @@ function analyzeFunction(
   file: SourceRevision,
   fn: Node,
   aliases: Map<string, string>,
+  atomicAccessors: Map<string, string>,
   signals: Signal[],
   positives: PositiveSignal[],
 ): void {
@@ -75,11 +77,101 @@ function analyzeFunction(
   if (syncAlias !== undefined) analyzeWaitGroups(file, body, syncAlias, signals, positives);
   analyzeCancellation(file, body, aliases, signals, positives);
   analyzeContextErrorClassification(file, fn, body, aliases, signals);
+  analyzeAtomicCapacityAdmission(file, fn, body, aliases, atomicAccessors, signals);
   analyzeChannels(file, body, signals);
   analyzeLoopVarCapture(file, body, signals);
   analyzeSelectDefaultBusy(file, body, signals);
   analyzeTickers(file, fn, body, aliases, signals);
   analyzeTimers(file, body, aliases, signals);
+}
+
+function atomicAccessorMethods(
+  root: Node,
+  source: string,
+  aliases: Map<string, string>,
+): Map<string, string> {
+  const hasAtomicImport = aliases.has("sync/atomic") || aliases.has("go.uber.org/atomic");
+  const result = new Map<string, string>();
+  if (!hasAtomicImport) return result;
+
+  for (const method of descendants(root, "method_declaration")) {
+    const name = method.childForFieldName("name");
+    const body = method.childForFieldName("body");
+    if (name === null || body === null) continue;
+    const returns = descendants(body, "return_statement");
+    if (returns.length !== 1) continue;
+    const loads = descendants(returns[0]!, "call_expression")
+      .map((call) => selectedCall(call, source))
+      .filter((call): call is { operand: string; field: string } => call !== undefined && call.field === "Load");
+    if (loads.length !== 1) continue;
+    const field = loads[0]!.operand.split(".").at(-1);
+    if (field !== undefined) result.set(sourceText(name, source), field);
+  }
+  return result;
+}
+
+function analyzeAtomicCapacityAdmission(
+  file: SourceRevision,
+  fn: Node,
+  body: Node,
+  aliases: Map<string, string>,
+  atomicAccessors: Map<string, string>,
+  signals: Signal[],
+): void {
+  if (!aliases.has("sync/atomic") && !aliases.has("go.uber.org/atomic")) return;
+  const functionName = functionNameOf(fn, file.current) ?? "";
+  if (!/^(?:Try)?(?:Add|Acquire|Admit|Claim|Reserve|Take)/i.test(functionName)) return;
+
+  const hasLock = descendants(body, "call_expression").some((call) => {
+    const selected = selectedCall(call, file.current);
+    return selected !== undefined && (selected.field === "Lock" || selected.field === "RLock");
+  });
+  if (hasLock) return;
+
+  for (const guard of descendants(body, "if_statement")) {
+    const condition = guard.childForFieldName("condition") ?? guard.namedChildren[0];
+    const consequence = guard.childForFieldName("consequence")
+      ?? guard.namedChildren.find((node) => node.type === "block");
+    if (condition === undefined || consequence === undefined) continue;
+    const conditionText = sourceText(condition, file.current);
+    if (!/>=?/.test(conditionText) || !/(?:max|limit|cap(?:acity)?|quota)/i.test(conditionText)) continue;
+    if (descendants(consequence, "return_statement").length === 0) continue;
+
+    const checkedFields = new Set<string>();
+    for (const call of descendants(condition, "call_expression")) {
+      const selected = selectedCall(call, file.current);
+      if (selected === undefined) continue;
+      if (selected.field === "Load") {
+        checkedFields.add(selected.operand);
+        continue;
+      }
+      const accessorField = atomicAccessors.get(selected.field);
+      if (accessorField !== undefined) checkedFields.add(`${selected.operand}.${accessorField}`);
+    }
+    if (checkedFields.size === 0) continue;
+
+    const mutation = descendants(body, "call_expression").find((call) => {
+      if (call.startIndex <= guard.endIndex) return false;
+      const selected = selectedCall(call, file.current);
+      return selected !== undefined &&
+        (selected.field === "Add" || selected.field === "Store" || selected.field === "Swap") &&
+        checkedFields.has(selected.operand);
+    });
+    if (mutation === undefined) continue;
+    const selected = selectedCall(mutation, file.current)!;
+    signals.push(signal(file, guard, "go-concurrency.atomic-capacity-check-update",
+      `${selected.operand} is checked against a capacity limit and updated later; the individually atomic operations do not make admission atomic.`,
+      { state: selected.operand, mutation: selected.field, form: "check-then-update" }));
+  }
+}
+
+function selectedCall(call: Node, source: string): { operand: string; field: string } | undefined {
+  const fn = call.childForFieldName("function");
+  if (fn?.type !== "selector_expression") return undefined;
+  const operand = fn.childForFieldName("operand");
+  const field = fn.childForFieldName("field");
+  if (operand === null || field === null) return undefined;
+  return { operand: sourceText(operand, source), field: sourceText(field, source) };
 }
 
 function analyzeCopyLocks(

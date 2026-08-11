@@ -30,6 +30,7 @@ test("P0 catalog concurrency rules detect vulnerable fixtures and stay quiet on 
     { dir: "p0-select-default-busy", id: "go-concurrency.select.default-busy" },
     { dir: "p0-ticker-not-stopped", id: "go-concurrency.ticker.not-stopped" },
     { dir: "p0-timer-not-stopped", id: "go-concurrency.timer.not-stopped" },
+    { dir: "p0-atomic-capacity-check-update", id: "go-concurrency.atomic-capacity-check-update" },
     { dir: "p0-concurrent-api-missing-test", id: "go-concurrency.concurrent-api.missing-test" },
   ] as const;
 

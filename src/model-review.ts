@@ -24,6 +24,7 @@ Authority:
 - cancellation errors swallowed or reported as ordinary per-item failures
 - goroutine lifecycle that can leak or race on shutdown
 - shared memory without synchronization when evidence is clear
+- capacity admission that reads an atomic counter, checks a max/limit, then increments separately; atomic operations do not make the compound check-and-update atomic. Accept a mutex, semaphore, or CAS retry that combines the check and reservation.
 
 Do NOT review generic style, HTTP, security tokens, or databases.
 Prefer silence. Zero to six observations. Cite only evidenceIds.

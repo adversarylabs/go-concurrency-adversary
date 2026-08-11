@@ -61,6 +61,16 @@ Regression entry: graded fixtures and corpus under `test/`.
 | **Stays quiet when** | defer cancel(); derive child contexts |
 | **Remediation** | Always defer cancel and pass derived ctx |
 
+### `go-concurrency.atomic-capacity-check-update`
+
+| | |
+| --- | --- |
+| **What** | Capacity is checked and reserved in separate atomic operations |
+| **Why** | Two callers can both observe room under the limit before either increments the counter |
+| **Looks for** | Add/Reserve/Acquire-style methods that compare an atomic load (or a thin load accessor) with a max/limit and later call Add/Store/Swap on the same state |
+| **Stays quiet when** | One mutex covers the check and update; a CAS retry loop performs admission; reservation happens before the limit decision |
+| **Remediation** | Combine the check and reservation with CAS, or use a mutex/weighted semaphore |
+
 ## Medium
 
 ### `go-concurrency.context.error-classification`
