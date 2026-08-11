@@ -429,20 +429,20 @@ Static = precise facts. LLM = enhancement + evidence-gated discovery. When unsur
   - https://go.dev/blog/pipelines
 
 ---
-### 20. `go-conc.context.background-in-request` — context.Background in request path
+### 20. `go-conc.context.background-in-request` — caller context replaced by Background/TODO
 
 | Field | Value |
 | --- | --- |
 | **Severity** | medium |
 | **Target confidence** | high |
 
-**What it is.** Detaches from cancel/deadlines.
+**What it is.** A function or callback receives a context but replaces it with `context.Background()` or `context.TODO()` for an operation, detaching that work from cancellation and deadlines.
 
-**Static detection.** Detect Background in HTTP/gRPC handlers.
+**Static detection.** Detect direct-scope Background/TODO calls in functions and callbacks with a usable `context.Context` parameter.
 
-**LLM role.** Use r.Context().
+**LLM role.** Explain which request, poll, or service lifecycle is lost.
 
-**False-positive guards.** Detached async after response with care.
+**False-positive guards.** No context parameter; propagate the parameter; deliberate detachment expressed with `context.WithoutCancel(ctx)` and bounded as appropriate.
 
 **Public examples of the bad pattern:**
   - https://go.dev/blog/context

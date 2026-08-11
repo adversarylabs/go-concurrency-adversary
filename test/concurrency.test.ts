@@ -76,6 +76,52 @@ func run(parent cx.Context) cx.Context {
   assert.ok(output.findings.some((finding) => finding.ruleId === "go-concurrency.context.cancellation"));
 });
 
+test("flags replacing an available context with Background or TODO", async () => {
+  const root = await repository(`package sample
+import (
+  cx "context"
+  "time"
+)
+func request(ctx cx.Context) {
+  detached, cancel := cx.WithTimeout(cx.Background(), time.Second)
+  defer cancel()
+  fetch(detached)
+}
+func poll(fn func(func(cx.Context) error)) {
+  fn(func(iteration cx.Context) error {
+    return fetch(cx.TODO())
+  })
+}
+func fetch(cx.Context) error { return nil }
+`);
+  const output = await review(root);
+  const finding = output.findings.find((item) => item.ruleId === "go-concurrency.context.background-in-request");
+  assert.equal(finding?.evidence.length, 2);
+  assert.match(finding?.recommendation ?? "", /WithoutCancel/);
+});
+
+test("allows propagation and explicit context detachment", async () => {
+  const root = await repository(`package sample
+import (
+  "context"
+  "time"
+)
+func propagated(ctx context.Context) error {
+  return fetch(ctx)
+}
+func deliberate(ctx context.Context) error {
+  detached := context.WithoutCancel(ctx)
+  bounded, cancel := context.WithTimeout(detached, time.Second)
+  defer cancel()
+  return fetch(bounded)
+}
+func root() error { return fetch(context.Background()) }
+func fetch(context.Context) error { return nil }
+`);
+  const output = await review(root);
+  assert.equal(output.findings.some((item) => item.ruleId === "go-concurrency.context.background-in-request"), false);
+});
+
 test("flags ordinary error handling that can swallow context cancellation", async () => {
   const root = await repository(`package sample
 import (

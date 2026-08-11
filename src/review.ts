@@ -14,6 +14,7 @@ export async function reviewConcurrency(
   const mutexCopy = matching(analysis, "go-concurrency.mutex.copy");
   const loopVars = matching(analysis, "go-concurrency.loopvar.capture");
   const cancellation = matching(analysis, "go-concurrency.context.cancellation");
+  const detachedContexts = matching(analysis, "go-concurrency.context.background-in-request");
   const cancellationErrors = matching(analysis, "go-concurrency.context.error-classification");
   const selectBusy = matching(analysis, "go-concurrency.select.default-busy");
   const tickers = matching(analysis, "go-concurrency.ticker.not-stopped");
@@ -74,6 +75,15 @@ export async function reviewConcurrency(
     whyItMatters: "Cancellation functions release timer and parent-child context resources; an errgroup's derived context carries peer failure to the remaining work.",
     impact: "Work can outlive its owner, timers and context relationships remain live longer than necessary, and peer failures may not stop dependent operations.",
     recommendation: "Retain the cancellation function and invoke it on every exit path, and pass the errgroup-derived context to work launched by that group.",
+  });
+  emitGroupedFinding(ctx, detachedContexts, {
+    title: "An operation discards its caller's context",
+    category: "reliability",
+    severity: "medium",
+    summary: (count) => `${count} operation${count === 1 ? " replaces" : "s replace"} an available caller context with context.Background or context.TODO.`,
+    whyItMatters: "The caller's context carries its cancellation and deadline. Replacing it silently detaches blocking work from request, poll, and shutdown lifecycles.",
+    impact: "A slow API call can continue after its owner stops waiting, causing timeout overruns, delayed shutdown, or leaked work.",
+    recommendation: "Pass the available context through, including as the parent of WithTimeout/WithCancel. If work must deliberately outlive cancellation, make that explicit with context.WithoutCancel(ctx) and add an appropriate bound.",
   });
   emitGroupedFinding(ctx, cancellationErrors, {
     title: "Context cancellation is handled as an ordinary failure",
@@ -143,6 +153,7 @@ export async function reviewConcurrency(
   if (mutexCopy.length > 0) staticSeverities.push("critical");
   if (loopVars.length > 0) staticSeverities.push("high");
   if (cancellation.length > 0) staticSeverities.push("medium");
+  if (detachedContexts.length > 0) staticSeverities.push("medium");
   if (cancellationErrors.length > 0) staticSeverities.push("medium");
   if (selectBusy.length > 0) staticSeverities.push("medium");
   if (tickers.length > 0) staticSeverities.push("medium");
@@ -157,6 +168,7 @@ export async function reviewConcurrency(
     loopVars.length > 0 ? "loop variable captures in goroutines" :
     atomicCapacity.length > 0 ? "non-atomic capacity admission" :
     cancellation.length > 0 ? "discarded cancellation ownership" :
+    detachedContexts.length > 0 ? "operations detached from caller cancellation" :
     cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" :
     selectBusy.length > 0 ? "busy-spinning select defaults" :
     tickers.length > 0 ? "tickers without Stop" :
@@ -182,6 +194,7 @@ export async function reviewConcurrency(
     mutexCopy,
     loopVars,
     cancellation,
+    detachedContexts,
     cancellationErrors,
     selectBusy,
     tickers,
@@ -278,6 +291,7 @@ function addAssessment(
     mutexCopy: Signal[];
     loopVars: Signal[];
     cancellation: Signal[];
+    detachedContexts: Signal[];
     cancellationErrors: Signal[];
     selectBusy: Signal[];
     tickers: Signal[];
@@ -361,6 +375,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would make cancellation ownership explicit before merging.",
+    });
+    return;
+  }
+  if (groups.detachedContexts.length > 0) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "An operation replaces its caller context, so it can outlive the request, poll, or shutdown lifecycle that started it.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would propagate the caller context or make deliberate detachment explicit and bounded before merging.",
     });
     return;
   }
