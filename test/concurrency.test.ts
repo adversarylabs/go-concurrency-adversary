@@ -76,6 +76,92 @@ func run(parent cx.Context) cx.Context {
   assert.ok(output.findings.some((finding) => finding.ruleId === "go-concurrency.context.cancellation"));
 });
 
+test("flags ordinary error handling that can swallow context cancellation", async () => {
+  const root = await repository(`package sample
+import (
+  "context"
+  "log"
+)
+func consume(ctx context.Context, items []string) error {
+  for _, item := range items {
+    value, err := fetch(ctx, item)
+    if err != nil {
+      log.Printf("fetch failed: %v", err)
+      continue
+    }
+    _ = value
+  }
+  return nil
+}
+func fetch(context.Context, string) (string, error) { return "", nil }
+`);
+  const output = await review(root);
+  const finding = output.findings.find((item) => item.ruleId === "go-concurrency.context.error-classification");
+  assert.equal(finding?.evidence.length, 1);
+  assert.match(finding?.evidence[0]?.message ?? "", /without distinguishing context cancellation/i);
+  assert.match(finding?.recommendation ?? "", /ctx\.Err\(\)|errors\.Is/i);
+});
+
+test("does not flag context-aware errors after cancellation is classified", async () => {
+  const root = await repository(`package sample
+import (
+  "context"
+  "errors"
+  "log"
+)
+func byContextState(ctx context.Context) error {
+  err := handle(ctx)
+  if err != nil {
+    if ctxErr := ctx.Err(); ctxErr != nil {
+      return ctxErr
+    }
+    log.Printf("handler failed: %v", err)
+  }
+  return nil
+}
+func byWrappedError(ctx context.Context) error {
+  err := handle(ctx)
+  if err != nil {
+    if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+      return err
+    }
+    log.Printf("handler failed: %v", err)
+  }
+  return nil
+}
+func handle(context.Context) error { return nil }
+`);
+  const output = await review(root);
+  assert.equal(output.findings.some((item) => item.ruleId === "go-concurrency.context.error-classification"), false);
+});
+
+test("does not flag direct propagation or errors from calls without context", async () => {
+  const root = await repository(`package sample
+import (
+  "context"
+  "log"
+)
+func direct(ctx context.Context) error {
+  err := handle(ctx)
+  if err != nil {
+    return err
+  }
+  return nil
+}
+func unrelated(ctx context.Context) error {
+  err := handleWithoutContext()
+  if err != nil {
+    log.Printf("handler failed: %v", err)
+  }
+  return ctx.Err()
+}
+func handle(context.Context) error { return nil }
+func handleWithoutContext() error { return nil }
+`);
+  const output = await review(root);
+  assert.equal(output.findings.some((item) => item.ruleId === "go-concurrency.context.error-classification"), false);
+});
+
 test("does not mistake a buffered channel or a started peer for a self-deadlock", async () => {
   const root = await repository(`package sample
 func buffered() int {

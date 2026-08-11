@@ -24,6 +24,7 @@ export interface Signal {
     | "go-concurrency.mutex.copy"
     | "go-concurrency.loopvar.capture"
     | "go-concurrency.context.cancellation"
+    | "go-concurrency.context.error-classification"
     | "go-concurrency.select.default-busy"
     | "go-concurrency.ticker.not-stopped"
     | "go-concurrency.timer.not-stopped"

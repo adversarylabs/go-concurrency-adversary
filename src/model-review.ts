@@ -21,6 +21,7 @@ Authority:
 - WaitGroup Add/Done/Wait ordering
 - channel self-deadlocks and missing peers
 - discarded cancel functions and errgroup context misuse
+- cancellation errors swallowed or reported as ordinary per-item failures
 - goroutine lifecycle that can leak or race on shutdown
 - shared memory without synchronization when evidence is clear
 

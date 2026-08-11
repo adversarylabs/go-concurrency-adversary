@@ -63,6 +63,16 @@ Regression entry: graded fixtures and corpus under `test/`.
 
 ## Medium
 
+### `go-concurrency.context.error-classification`
+
+| | |
+| --- | --- |
+| **What** | Context-aware call errors treated as ordinary recoverable/reportable failures |
+| **Why** | Cancellation can be swallowed, logged as a failure, or retried during shutdown |
+| **Looks for** | An error from a call passed `context.Context`, followed by logging/rejection/continue without cancellation classification |
+| **Stays quiet when** | The error is returned directly, the call does not receive context, or `ctx.Err()` / `errors.Is` handles cancellation first |
+| **Remediation** | Classify and propagate cancellation before ordinary error handling |
+
 ### `go-concurrency.loopvar.capture`
 
 | | |

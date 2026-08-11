@@ -74,6 +74,7 @@ function analyzeFunction(
   if (body === null) return;
   if (syncAlias !== undefined) analyzeWaitGroups(file, body, syncAlias, signals, positives);
   analyzeCancellation(file, body, aliases, signals, positives);
+  analyzeContextErrorClassification(file, fn, body, aliases, signals);
   analyzeChannels(file, body, signals);
   analyzeLoopVarCapture(file, body, signals);
   analyzeSelectDefaultBusy(file, body, signals);
@@ -289,6 +290,100 @@ function analyzeCancellation(
         { helper: helper.helper, discarded: "cancel-function-unused" }));
     }
   }
+}
+
+function analyzeContextErrorClassification(
+  file: SourceRevision,
+  fn: Node,
+  body: Node,
+  aliases: Map<string, string>,
+  signals: Signal[],
+): void {
+  const contextAlias = aliases.get("context");
+  if (contextAlias === undefined) return;
+
+  const contextNames = new Set(
+    parameterDeclarations(fn)
+      .filter((parameter) => {
+        const type = parameter.childForFieldName("type");
+        return type !== null && sourceText(type, file.current) === `${contextAlias}.Context`;
+      })
+      .map((parameter) => parameter.childForFieldName("name"))
+      .filter((name): name is Node => name !== null)
+      .map((name) => sourceText(name, file.current)),
+  );
+  if (contextNames.size === 0) return;
+
+  for (const list of descendants(body, "statement_list")) {
+    const statements = list.namedChildren;
+    for (let index = 0; index + 1 < statements.length; index += 1) {
+      const operation = contextAwareErrorAssignment(statements[index]!, file.current, contextNames);
+      if (operation === undefined) continue;
+
+      const handler = statements[index + 1]!;
+      if (handler.type !== "if_statement" || !testsNonNil(handler, file.current, operation.errorName)) continue;
+      if (!hasOrdinaryErrorHandling(handler, file.current)) continue;
+      if (classifiesCancellation(handler, file.current, operation.contextName, operation.errorName, contextAlias)) continue;
+
+      signals.push(signal(file, handler, "go-concurrency.context.error-classification",
+        `Error from a call using ${operation.contextName} is handled as an ordinary failure without distinguishing context cancellation.`,
+        {
+          context: operation.contextName,
+          error: operation.errorName,
+          form: "context-aware-error-handling",
+        }));
+    }
+  }
+}
+
+function contextAwareErrorAssignment(
+  statement: Node,
+  source: string,
+  contextNames: Set<string>,
+): { contextName: string; errorName: string } | undefined {
+  if (statement.type !== "short_var_declaration" && statement.type !== "assignment_statement") return undefined;
+  const left = statement.childForFieldName("left");
+  const right = statement.childForFieldName("right");
+  const names = left?.namedChildren.map((node) => sourceText(node, source)) ?? [];
+  const values = right?.namedChildren ?? [];
+  if (!names.includes("err") || values.length !== 1 || values[0]!.type !== "call_expression") return undefined;
+
+  const argumentsNode = values[0]!.childForFieldName("arguments");
+  if (argumentsNode === null) return undefined;
+  const contextName = [...contextNames].find((name) => containsIdentifier(argumentsNode, source, name));
+  return contextName === undefined ? undefined : { contextName, errorName: "err" };
+}
+
+function testsNonNil(statement: Node, source: string, errorName: string): boolean {
+  const condition = statement.childForFieldName("condition") ?? statement.namedChildren[0];
+  if (condition === undefined) return false;
+  const compact = sourceText(condition, source).replace(/\s+/g, "");
+  return compact.includes(`${errorName}!=nil`) || compact.includes(`nil!=${errorName}`);
+}
+
+function hasOrdinaryErrorHandling(statement: Node, source: string): boolean {
+  if (descendants(statement, "continue_statement").length > 0) return true;
+  return descendants(statement, "call_expression").some((call) => {
+    const fn = call.childForFieldName("function");
+    if (fn?.type !== "selector_expression") return false;
+    const field = fn.childForFieldName("field");
+    if (field === null) return false;
+    return /^(?:Error|Errorf|Errorln|Warn|Warnf|Warnln|Nack|Reject|Fail|Failf|Fatal|Fatalf)$/i
+      .test(sourceText(field, source));
+  });
+}
+
+function classifiesCancellation(
+  statement: Node,
+  source: string,
+  contextName: string,
+  errorName: string,
+  contextAlias: string,
+): boolean {
+  if (selectorCalls(statement, source, contextName, "Err").length > 0) return true;
+  const compact = sourceText(statement, source).replace(/\s+/g, "");
+  return compact.includes(`.Is(${errorName},${contextAlias}.Canceled)`) ||
+    compact.includes(`.Is(${errorName},${contextAlias}.DeadlineExceeded)`);
 }
 
 function identifierUsedOutsideBinding(
