@@ -36,6 +36,7 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
     const atomicAccessors = atomicAccessorMethods(tree.rootNode, file.current, aliases);
     const signals: Signal[] = [];
     const positives: PositiveSignal[] = [];
+    analyzeContextDetachment(file, tree.rootNode, aliases, signals);
     for (const fn of [
       ...descendants(tree.rootNode, "function_declaration"),
       ...descendants(tree.rootNode, "method_declaration"),
@@ -52,6 +53,65 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
   } finally {
     tree.delete();
   }
+}
+
+function analyzeContextDetachment(
+  file: SourceRevision,
+  root: Node,
+  aliases: Map<string, string>,
+  signals: Signal[],
+): void {
+  const contextAlias = aliases.get("context");
+  if (contextAlias === undefined) return;
+
+  const callables = [
+    ...descendants(root, "function_declaration"),
+    ...descendants(root, "method_declaration"),
+    ...descendants(root, "func_literal"),
+  ];
+  for (const fn of callables) {
+    const body = fn.childForFieldName("body");
+    if (body === null) continue;
+    const parentContexts = parameterDeclarations(fn)
+      .filter((parameter) => {
+        const type = parameter.childForFieldName("type");
+        return type !== null && sourceText(type, file.current) === `${contextAlias}.Context`;
+      })
+      .map((parameter) => parameter.childForFieldName("name"))
+      .filter((name): name is Node => name !== null)
+      .map((name) => sourceText(name, file.current))
+      .filter((name) => name !== "_");
+    if (parentContexts.length === 0) continue;
+
+    for (const call of directScopeDescendants(body, "call_expression")) {
+      const functionNode = call.childForFieldName("function");
+      if (functionNode === null) continue;
+      const called = sourceText(functionNode, file.current);
+      if (called !== `${contextAlias}.Background` && called !== `${contextAlias}.TODO`) continue;
+      const helper = called.slice(called.lastIndexOf(".") + 1);
+      signals.push(signal(file, call, "go-concurrency.context.background-in-request",
+        `${called} detaches this operation from ${parentContexts[0]}'s cancellation and deadline.`, {
+          parentContext: parentContexts[0],
+          detachedWith: helper,
+          form: "context-replacement",
+        }));
+    }
+  }
+}
+
+function directScopeDescendants(node: Node, type: string): Node[] {
+  const result: Node[] = [];
+  const pending = [...node.namedChildren].reverse();
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined || current.type === "func_literal") continue;
+    if (current.type === type) result.push(current);
+    for (let index = current.namedChildCount - 1; index >= 0; index -= 1) {
+      const child = current.namedChild(index);
+      if (child !== null) pending.push(child);
+    }
+  }
+  return result;
 }
 
 function isChangedEvidence(file: SourceRevision, line: number, endLine = line): boolean {

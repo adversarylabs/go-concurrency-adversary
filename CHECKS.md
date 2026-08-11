@@ -83,6 +83,16 @@ Regression entry: graded fixtures and corpus under `test/`.
 | **Stays quiet when** | The error is returned directly, the call does not receive context, or `ctx.Err()` / `errors.Is` handles cancellation first |
 | **Remediation** | Classify and propagate cancellation before ordinary error handling |
 
+### `go-concurrency.context.background-in-request`
+
+| | |
+| --- | --- |
+| **What** | An operation replaces an available caller context with `context.Background()` or `context.TODO()` |
+| **Why** | Blocking work no longer observes the caller's deadline or cancellation |
+| **Looks for** | Direct-scope `Background` / `TODO` calls in functions and callbacks that receive `context.Context` |
+| **Stays quiet when** | The caller context is propagated, no caller context exists, or deliberate detachment uses `context.WithoutCancel(ctx)` |
+| **Remediation** | Pass the caller context through; make intentional detachment explicit and bounded |
+
 ### `go-concurrency.loopvar.capture`
 
 | | |
