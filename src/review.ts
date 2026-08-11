@@ -18,6 +18,7 @@ export async function reviewConcurrency(
   const selectBusy = matching(analysis, "go-concurrency.select.default-busy");
   const tickers = matching(analysis, "go-concurrency.ticker.not-stopped");
   const timers = matching(analysis, "go-concurrency.timer.not-stopped");
+  const atomicCapacity = matching(analysis, "go-concurrency.atomic-capacity-check-update");
   const concurrentApiMissing = matching(analysis, "go-concurrency.concurrent-api.missing-test");
 
   emitGroupedFinding(ctx, deadlocks, {
@@ -113,6 +114,16 @@ export async function reviewConcurrency(
     recommendation: "Use time.NewTimer with Reset/Stop in the loop, or restructure to a single timer outside the loop.",
   });
 
+  emitGroupedFinding(ctx, atomicCapacity, {
+    title: "Capacity admission is split across atomic operations",
+    category: "correctness",
+    severity: "high",
+    summary: (count) => `${count} capacity admission path${count === 1 ? "" : "s"} check an atomic counter and update it in a separate operation.`,
+    whyItMatters: "Atomic loads and increments are individually safe, but another goroutine can pass the same limit check before either increment becomes visible.",
+    impact: "Concurrent callers can oversubscribe the protected byte, item, or request budget even though every counter access uses atomics.",
+    recommendation: "Make the limit check and reservation one operation with a CAS retry loop, or guard both with the same mutex/semaphore.",
+  });
+
   emitGroupedFinding(ctx, concurrentApiMissing, {
     title: "Concurrent API guarantee lacks test for overlapping calls",
     category: "correctness",
@@ -136,6 +147,7 @@ export async function reviewConcurrency(
   if (selectBusy.length > 0) staticSeverities.push("medium");
   if (tickers.length > 0) staticSeverities.push("medium");
   if (timers.length > 0) staticSeverities.push(timerSeverity(analysis.goVersion));
+  if (atomicCapacity.length > 0) staticSeverities.push("high");
   if (concurrentApiMissing.length > 0) staticSeverities.push("medium");
   const staticPrimaryConcern =
     deadlocks.length > 0 ? "local channel self-deadlocks" :
@@ -143,6 +155,7 @@ export async function reviewConcurrency(
     waitGroups.length > 0 ? "WaitGroup registration races" :
     waitGroupCopied.length > 0 ? "WaitGroup value copies" :
     loopVars.length > 0 ? "loop variable captures in goroutines" :
+    atomicCapacity.length > 0 ? "non-atomic capacity admission" :
     cancellation.length > 0 ? "discarded cancellation ownership" :
     cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" :
     selectBusy.length > 0 ? "busy-spinning select defaults" :
@@ -173,6 +186,7 @@ export async function reviewConcurrency(
     selectBusy,
     tickers,
     timers,
+    atomicCapacity,
     concurrentApiMissing,
     ...(analysis.goVersion === undefined ? {} : { goVersion: analysis.goVersion }),
   });
@@ -268,6 +282,7 @@ function addAssessment(
     selectBusy: Signal[];
     tickers: Signal[];
     timers: Signal[];
+    atomicCapacity: Signal[];
     concurrentApiMissing: Signal[];
     goVersion?: GoVersion;
   },
@@ -324,6 +339,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would bind loop variables before launching goroutines before merging.",
+    });
+    return;
+  }
+  if (groups.atomicCapacity.length > 0) {
+    ctx.review.assessment({
+      risk: "high",
+      summary: "The capacity guard is a check-then-update sequence, so concurrent callers can both pass the limit and oversubscribe the shared budget.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would make capacity admission atomic before merging.",
     });
     return;
   }
