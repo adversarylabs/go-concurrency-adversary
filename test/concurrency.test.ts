@@ -87,6 +87,94 @@ func work() {}
   assert.match(finding?.recommendation ?? "", /defer wg\.Done|defer WaitGroup completion/i);
 });
 
+test("recognizes statically initialized and multi-name WaitGroups", async () => {
+  const root = await repository(`package sample
+import "sync"
+
+func varInitializer(skip bool) {
+  var wg = sync.WaitGroup{}
+  wg.Add(1)
+  go func() { if skip { return }; wg.Done() }()
+}
+
+func addressLiteral(skip bool) {
+  wg := &sync.WaitGroup{}
+  wg.Add(1)
+  go func() { if skip { return }; wg.Done() }()
+}
+
+func allocated(skip bool) {
+  wg := new(sync.WaitGroup)
+  wg.Add(1)
+  go func() { if skip { return }; wg.Done() }()
+}
+
+func groupedVar(skip bool) {
+  var first, wg sync.WaitGroup
+  wg.Add(1)
+  go func() { if skip { return }; wg.Done() }()
+  _ = first
+}
+
+func inferredVar(skip bool) {
+  var first, wg = sync.WaitGroup{}, &sync.WaitGroup{}
+  wg.Add(1)
+  go func() { if skip { return }; wg.Done() }()
+  _ = first
+}
+
+func groupedShort(skip bool) {
+  first, wg := sync.WaitGroup{}, new(sync.WaitGroup)
+  wg.Add(1)
+  go func() { if skip { return }; wg.Done() }()
+  _ = first
+}
+`);
+  const output = await review(root);
+  const finding = output.findings.find((item) => item.ruleId === "go-concurrency.waitgroup.done-not-deferred");
+  assert.equal(finding?.evidence.length, 6);
+});
+
+test("statically initialized WaitGroups with deferred completion stay clean", async () => {
+  const root = await repository(`package sample
+import "sync"
+
+func varInitializer(skip bool) {
+  var wg = sync.WaitGroup{}
+  wg.Add(1)
+  go func() { defer wg.Done(); if skip { return } }()
+}
+
+func addressLiteral(skip bool) {
+  wg := &sync.WaitGroup{}
+  wg.Add(1)
+  go func() { defer wg.Done(); if skip { return } }()
+}
+
+func allocated(skip bool) {
+  wg := new(sync.WaitGroup)
+  wg.Add(1)
+  go func() { defer wg.Done(); if skip { return } }()
+}
+
+func groupedVar(skip bool) {
+  var first, wg sync.WaitGroup
+  wg.Add(1)
+  go func() { defer wg.Done(); if skip { return } }()
+  _ = first
+}
+
+func groupedShort(skip bool) {
+  first, wg := sync.WaitGroup{}, new(sync.WaitGroup)
+  wg.Add(1)
+  go func() { defer wg.Done(); if skip { return } }()
+  _ = first
+}
+`);
+  const output = await review(root);
+  assert.equal(output.findings.some((item) => item.ruleId === "go-concurrency.waitgroup.done-not-deferred"), false);
+});
+
 test("supports aliased standard-library imports", async () => {
   const root = await repository(`package sample
 import cx "context"

@@ -339,21 +339,25 @@ function analyzeWaitGroups(
   positives: PositiveSignal[],
 ): void {
   const waitGroups = new Set<string>();
+  const waitGroupType = `${syncAlias}.WaitGroup`;
   for (const declaration of descendants(body, "var_spec")) {
     const type = declaration.childForFieldName("type");
-    const name = declaration.childForFieldName("name");
-    if (type !== null && name !== null && sourceText(type, file.current) === `${syncAlias}.WaitGroup`) {
-      waitGroups.add(sourceText(name, file.current));
+    const names = declaration.namedChildren
+      .filter((node) => node.type === "identifier")
+      .map((node) => sourceText(node, file.current));
+    if (type !== null && sourceText(type, file.current) === waitGroupType) {
+      names.filter((name) => name !== "_").forEach((name) => waitGroups.add(name));
+      continue;
     }
+    const values = declaration.childForFieldName("value")?.namedChildren ?? [];
+    addInitializedWaitGroups(waitGroups, names, values, file.current, waitGroupType);
   }
   for (const declaration of descendants(body, "short_var_declaration")) {
     const left = declaration.childForFieldName("left");
     const right = declaration.childForFieldName("right");
     const names = left?.namedChildren.map((node) => sourceText(node, file.current)) ?? [];
     const values = right?.namedChildren ?? [];
-    if (names.length === 1 && values.length === 1 && sourceText(values[0]!, file.current).startsWith(`${syncAlias}.WaitGroup{`)) {
-      waitGroups.add(names[0]!);
-    }
+    addInitializedWaitGroups(waitGroups, names, values, file.current, waitGroupType);
   }
 
   for (const name of waitGroups) {
@@ -380,6 +384,26 @@ function analyzeWaitGroups(
     }
     analyzeWaitGroupCompletion(file, body, name, signals);
   }
+}
+
+function addInitializedWaitGroups(
+  waitGroups: Set<string>,
+  names: string[],
+  values: Node[],
+  source: string,
+  waitGroupType: string,
+): void {
+  if (names.length !== values.length) return;
+  const escapedType = waitGroupType.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const initializer = new RegExp(
+    `^(?:${escapedType}\\s*\\{\\s*\\}|&\\s*${escapedType}\\s*\\{\\s*\\}|new\\s*\\(\\s*${escapedType}\\s*\\))$`,
+  );
+  values.forEach((value, index) => {
+    const name = names[index];
+    if (name !== undefined && name !== "_" && initializer.test(sourceText(value, source))) {
+      waitGroups.add(name);
+    }
+  });
 }
 
 function analyzeWaitGroupCompletion(file: SourceRevision, body: Node, name: string, signals: Signal[]): void {
