@@ -1,5 +1,5 @@
 name: go/concurrency
-version: 0.0.15
+version: 0.0.16
 description: Reviews Go concurrency lifecycle, cancellation, synchronization, and channel ownership.
 
 triggers:
