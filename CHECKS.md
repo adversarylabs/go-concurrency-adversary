@@ -21,6 +21,17 @@ Regression entry: graded fixtures and corpus under `test/`.
 | **Stays quiet when** | Add before go; Done in defer; single Wait owner |
 | **Remediation** | Own WaitGroup in the starter; Add before launching |
 
+### `go-concurrency.waitgroup.done-not-deferred`
+
+| | |
+| --- | --- |
+| **What** | A goroutine can return before its bare `WaitGroup.Done` call |
+| **Why** | Completion bookkeeping at the bottom of a goroutine is skipped by earlier exits, leaving the counter positive after the worker is gone |
+| **Looks for** | A locally known `sync.WaitGroup` whose goroutine closure has a return before a non-deferred `Done` |
+| **Stays quiet when** | `Done` is deferred at goroutine entry (directly or through a deferred closure); a direct loop body owns per-iteration accounting; the receiver is not the known WaitGroup; or no exit precedes the bare call |
+| **Public examples** | GitHub’s merged [`wgdonenotdeferred` analyzer](https://github.com/github/gh-aw/pull/40837) and its [approved closure-scope correction](https://github.com/github/gh-aw/pull/41026) |
+| **Remediation** | Register before launch and make `defer wg.Done()` the first operation inside the goroutine |
+
 ### `go-concurrency.waitgroup.copied`
 
 | | |

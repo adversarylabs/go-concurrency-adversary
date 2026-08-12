@@ -378,7 +378,69 @@ function analyzeWaitGroups(
         });
       }
     }
+    analyzeWaitGroupCompletion(file, body, name, signals);
   }
+}
+
+function analyzeWaitGroupCompletion(file: SourceRevision, body: Node, name: string, signals: Signal[]): void {
+  for (const goStatement of descendants(body, "go_statement")) {
+    const closure = goStatement.namedChildren.find((child) => child.type === "func_literal") ??
+      descendants(goStatement, "func_literal")[0];
+    if (closure === undefined) continue;
+    const closureBody = closure.childForFieldName("body");
+    if (closureBody === null) continue;
+
+    const doneCalls = directScopeDescendants(closureBody, "call_expression")
+      .filter((call) => isSelectorCall(call, file.current, name, "Done"));
+    if (doneCalls.length === 0 || doneCalls.some(isDeferredCall)) continue;
+
+    const returns = directScopeDescendants(closureBody, "return_statement");
+    for (const done of doneCalls) {
+      if (isInsideLoop(done, closureBody) || isInsideDeferredClosure(done, closureBody)) continue;
+      const earlierReturn = returns.find((statement) => statement.startIndex < done.startIndex);
+      if (earlierReturn === undefined) continue;
+      signals.push(signal(file, earlierReturn, "go-concurrency.waitgroup.done-not-deferred",
+        `${name}.Done is reached only after an earlier return path in this goroutine; Wait can remain blocked when that path exits.`, {
+          waitGroup: name,
+          operation: "Done",
+          placement: "after-early-return",
+          doneLine: done.startPosition.row + 1,
+        }));
+      break;
+    }
+  }
+}
+
+function isSelectorCall(call: Node, source: string, receiver: string, field: string): boolean {
+  const fn = call.childForFieldName("function");
+  if (fn?.type !== "selector_expression") return false;
+  const operand = fn.childForFieldName("operand");
+  const selected = fn.childForFieldName("field");
+  return operand !== null && selected !== null &&
+    sourceText(operand, source) === receiver && sourceText(selected, source) === field;
+}
+
+function isDeferredCall(call: Node): boolean {
+  return call.parent?.type === "defer_statement";
+}
+
+function isInsideDeferredClosure(node: Node, boundary: Node): boolean {
+  let current = node.parent;
+  while (current !== null && current.id !== boundary.id) {
+    if (current.type === "func_literal" && current.parent?.type === "call_expression" && current.parent.parent?.type === "defer_statement") return true;
+    current = current.parent;
+  }
+  return false;
+}
+
+function isInsideLoop(node: Node, boundary: Node): boolean {
+  let current = node.parent;
+  while (current !== null && current.id !== boundary.id) {
+    if (current.type === "func_literal") return false;
+    if (current.type === "for_statement") return true;
+    current = current.parent;
+  }
+  return false;
 }
 
 function hasOrderedWaitGroupLifecycle(body: Node, source: string, name: string): boolean {

@@ -64,6 +64,29 @@ func run() {
   assert.match(findings[0]?.recommendation ?? "", /before each go statement/i);
 });
 
+test("anchors skippable WaitGroup completion at the early return", async () => {
+  const root = await repository(`package sample
+import "sync"
+func launch(skip bool) {
+  var workers sync.WaitGroup
+  workers.Add(1)
+  go func() {
+    if skip { return }
+    work()
+    workers.Done()
+  }()
+  workers.Wait()
+}
+func work() {}
+`);
+  const output = await review(root);
+  const finding = output.findings.find((item) => item.ruleId === "go-concurrency.waitgroup.done-not-deferred");
+  assert.equal(finding?.evidence.length, 1);
+  assert.equal(finding?.evidence[0]?.location?.line, 7);
+  assert.equal(finding?.evidence[0]?.data?.doneLine, 9);
+  assert.match(finding?.recommendation ?? "", /defer wg\.Done|defer WaitGroup completion/i);
+});
+
 test("supports aliased standard-library imports", async () => {
   const root = await repository(`package sample
 import cx "context"

@@ -10,6 +10,7 @@ export async function reviewConcurrency(
 ): Promise<void> {
   const deadlocks = matching(analysis, "go-concurrency.channel.self-deadlock");
   const waitGroups = matching(analysis, "go-concurrency.waitgroup.lifecycle");
+  const waitGroupCompletion = matching(analysis, "go-concurrency.waitgroup.done-not-deferred");
   const waitGroupCopied = matching(analysis, "go-concurrency.waitgroup.copied");
   const mutexCopy = matching(analysis, "go-concurrency.mutex.copy");
   const loopVars = matching(analysis, "go-concurrency.loopvar.capture");
@@ -39,6 +40,15 @@ export async function reviewConcurrency(
     whyItMatters: "The parent can reach Wait before the worker increments the counter, allowing Wait to return early or creating invalid Add/Wait reuse.",
     impact: "Shutdown and completion code can run while workers are still active, causing data races, resource teardown, or intermittent test failures.",
     recommendation: "Call Add in the launching goroutine before each go statement, then defer Done as the first operation inside the worker.",
+  });
+  emitGroupedFinding(ctx, waitGroupCompletion, {
+    title: "WaitGroup completion can be skipped on early return",
+    category: "correctness",
+    severity: "high",
+    summary: (count) => `${count} goroutine${count === 1 ? " has" : "s have"} a return path before a non-deferred WaitGroup Done call.`,
+    whyItMatters: "WaitGroup completion bookkeeping must run on every goroutine exit path. A bare Done at the bottom is skipped when an earlier branch returns.",
+    impact: "The counter remains positive and any waiter can block indefinitely after the worker has already exited.",
+    recommendation: "Move `defer wg.Done()` to the start of the goroutine closure, after registration in the launching goroutine.",
   });
   emitGroupedFinding(ctx, waitGroupCopied, {
     title: "WaitGroup is copied by value",
@@ -149,6 +159,7 @@ export async function reviewConcurrency(
   const staticSeverities: Array<"none" | "low" | "medium" | "high" | "critical"> = [];
   if (deadlocks.length > 0) staticSeverities.push("high");
   if (waitGroups.length > 0) staticSeverities.push("high");
+  if (waitGroupCompletion.length > 0) staticSeverities.push("high");
   if (waitGroupCopied.length > 0) staticSeverities.push("high");
   if (mutexCopy.length > 0) staticSeverities.push("critical");
   if (loopVars.length > 0) staticSeverities.push("high");
@@ -164,6 +175,7 @@ export async function reviewConcurrency(
     deadlocks.length > 0 ? "local channel self-deadlocks" :
     mutexCopy.length > 0 ? "copied mutex values" :
     waitGroups.length > 0 ? "WaitGroup registration races" :
+    waitGroupCompletion.length > 0 ? "skippable WaitGroup completion" :
     waitGroupCopied.length > 0 ? "WaitGroup value copies" :
     loopVars.length > 0 ? "loop variable captures in goroutines" :
     atomicCapacity.length > 0 ? "non-atomic capacity admission" :
@@ -190,6 +202,7 @@ export async function reviewConcurrency(
   addAssessment(ctx, {
     deadlocks,
     waitGroups,
+    waitGroupCompletion,
     waitGroupCopied,
     mutexCopy,
     loopVars,
@@ -287,6 +300,7 @@ function addAssessment(
   groups: {
     deadlocks: Signal[];
     waitGroups: Signal[];
+    waitGroupCompletion: Signal[];
     waitGroupCopied: Signal[];
     mutexCopy: Signal[];
     loopVars: Signal[];
@@ -331,6 +345,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would move worker registration into the launching goroutine before merging.",
+    });
+    return;
+  }
+  if (groups.waitGroupCompletion.length > 0) {
+    ctx.review.assessment({
+      risk: "high",
+      summary: "Worker completion is not reliable because an early goroutine return can skip its WaitGroup Done call and leave the waiter blocked.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would defer WaitGroup completion at goroutine entry before merging.",
     });
     return;
   }

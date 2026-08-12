@@ -22,6 +22,7 @@ const review = async (rel: string) => {
 test("P0 catalog concurrency rules detect vulnerable fixtures and stay quiet on clean", async () => {
   const cases = [
     { dir: "p0-waitgroup-lifecycle", id: "go-concurrency.waitgroup.lifecycle" },
+    { dir: "p0-waitgroup-done-not-deferred", id: "go-concurrency.waitgroup.done-not-deferred" },
     { dir: "p0-waitgroup-copied", id: "go-concurrency.waitgroup.copied" },
     { dir: "p0-mutex-copy", id: "go-concurrency.mutex.copy" },
     { dir: "p0-loopvar-capture", id: "go-concurrency.loopvar.capture" },
