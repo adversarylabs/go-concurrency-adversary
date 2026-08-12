@@ -22,7 +22,7 @@ Highlights:
 | Area | Examples |
 | --- | --- |
 | Cancellation | Unused cancel functions; context not derived for child work |
-| WaitGroup | Add inside goroutine; WaitGroup copied by value; lifecycle races |
+| WaitGroup | Add inside goroutine; early return before bare Done; WaitGroup copied by value |
 | Channels | Self-deadlock patterns; busy `select` with default |
 | Timers | `time.Ticker` / `Timer` not stopped |
 | Loops | Loop variable capture in goroutines |

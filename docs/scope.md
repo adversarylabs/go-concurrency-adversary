@@ -14,6 +14,7 @@ Review Go concurrency: lifecycle, cancellation, synchronization, races, and chan
 
 - Data races and shared mutable state without synchronization
 - Goroutine leaks; missing WaitGroup/errgroup joins
+- WaitGroup completion paths that an early goroutine return can skip
 - Cancellation / context not propagated or ignored
 - Channel ownership and close races; select starvation
 - Deadlocks, lock ordering, incorrect mutex use

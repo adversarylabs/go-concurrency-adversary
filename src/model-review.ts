@@ -19,6 +19,7 @@ export const GO_CONCURRENCY_MODEL_PROMPT = `You are reviewing Go concurrency for
 
 Authority:
 - WaitGroup Add/Done/Wait ordering
+- WaitGroup Done calls that can be skipped by an earlier goroutine return; accept defer at goroutine entry and do not demand defer for direct loop-body accounting
 - channel self-deadlocks and missing peers
 - discarded cancel functions and errgroup context misuse
 - cancellation errors swallowed or reported as ordinary per-item failures

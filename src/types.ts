@@ -30,6 +30,7 @@ export interface Signal {
     | "go-concurrency.ticker.not-stopped"
     | "go-concurrency.timer.not-stopped"
     | "go-concurrency.channel.self-deadlock"
+    | "go-concurrency.waitgroup.done-not-deferred"
     | "go-concurrency.atomic-capacity-check-update"
     | "go-concurrency.concurrent-api.missing-test";
   path: string;
