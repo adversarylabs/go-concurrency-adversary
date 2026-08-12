@@ -1,5 +1,5 @@
 name: go/concurrency
-version: 0.0.13
+version: 0.0.14
 description: Reviews Go concurrency lifecycle, cancellation, synchronization, and channel ownership.
 
 triggers:
@@ -30,4 +30,3 @@ permissions:
 
 findings:
   format: adversary.review.v1
-
