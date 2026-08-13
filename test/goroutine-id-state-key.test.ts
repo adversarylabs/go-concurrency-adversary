@@ -141,6 +141,183 @@ test("stays quiet when goroutine identity parsing fails closed", async () => {
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
 });
 
+test("requires stack-to-prefix-to-strconv provenance and ignores decoy literals and reassignment", async () => {
+  const root = await repository({
+    "decoys.go": `package sample
+
+import (
+  "os"
+  "runtime"
+  "strconv"
+  "strings"
+  "sync"
+)
+
+type holder struct { trackers sync.Map }
+type parser struct{}
+func (parser) ParseInt(string, int, int) (int64, error) { return 7, nil }
+
+func unrelatedParse() int64 {
+  var buf [64]byte
+  _ = runtime.Stack(buf[:], false)
+  _ = strings.TrimPrefix("not stack text", "goroutine ")
+  id, _ := strconv.ParseInt(os.Getenv("REQUEST_ID"), 10, 64)
+  return id
+}
+
+func reassignedStackText() int64 {
+  var buf [64]byte
+  n := runtime.Stack(buf[:], false)
+  text := strings.TrimPrefix(string(buf[:n]), "goroutine ")
+  text = os.Getenv("REQUEST_ID")
+  id, _ := strconv.ParseInt(text, 10, 64)
+  return id
+}
+
+func customParser() int64 {
+  var buf [64]byte
+  n := runtime.Stack(buf[:], false)
+  text := strings.TrimPrefix(string(buf[:n]), "goroutine ")
+  id, _ := (parser{}).ParseInt(text, 10, 64)
+  return id
+}
+
+func nestedReturnOnly() int64 {
+  var buf [64]byte
+  n := runtime.Stack(buf[:], false)
+  text := strings.TrimPrefix(string(buf[:n]), "goroutine ")
+  id, _ := strconv.ParseInt(text, 10, 64)
+  _ = func() int64 { return id }
+  return 7
+}
+
+func (h *holder) Store(value any) {
+  h.trackers.Store(unrelatedParse(), value)
+  h.trackers.Store(reassignedStackText(), value)
+  h.trackers.Store(customParser(), value)
+  h.trackers.Store(nestedReturnOnly(), value)
+}
+`,
+  });
+  const output = await review(root);
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
+test("supports aliased standard packages and requires the derived ID in key position", async () => {
+  const root = await repository({
+    "aliases.go": `package sample
+
+import (
+  r "runtime"
+  c "strconv"
+  s "strings"
+  y "sync"
+)
+
+type holder struct { trackers y.Map }
+
+func goroutineID() int64 {
+  var buf [64]byte
+  n := r.Stack(buf[:], false)
+  text := s.TrimPrefix(string(buf[:n]), "goroutine ")
+  id, _ := c.ParseInt(s.Fields(text)[0], 10, 64)
+  return id
+}
+
+func (h *holder) Store(requestID string, value any) {
+  h.trackers.Store(requestID, goroutineID())
+}
+func (h *holder) Load() any { value, _ := h.trackers.Load(goroutineID()); return value }
+`,
+  });
+  const output = await review(root);
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.equal(finding?.evidence.length, 1);
+  assert.match(finding?.evidence[0]?.snippet ?? "", /Load\(goroutineID\(\)\)/);
+});
+
+test("stays quiet when package or helper identifiers are shadowed", async () => {
+  const root = await repository({
+    "shadowed.go": `package sample
+
+import (
+  "runtime"
+  "strconv"
+  "strings"
+  "sync"
+)
+
+var _ = runtime.NumCPU
+type fakeRuntime struct{}
+func (fakeRuntime) Stack([]byte, bool) int { return 1 }
+type holder struct { trackers sync.Map }
+
+func packageShadow(runtime fakeRuntime) int64 {
+  var buf [64]byte
+  n := runtime.Stack(buf[:], false)
+  text := strings.TrimPrefix(string(buf[:n]), "goroutine ")
+  id, _ := strconv.ParseInt(text, 10, 64)
+  return id
+}
+
+func realGoroutineID() int64 {
+  var buf [64]byte
+  n := runtime.Stack(buf[:], false)
+  text := strings.TrimPrefix(string(buf[:n]), "goroutine ")
+  id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  return id
+}
+
+func (h *holder) Store(value any) {
+  realGoroutineID := func() int64 { return 7 }
+  h.trackers.Store(realGoroutineID(), value)
+  h.trackers.Store(packageShadow(fakeRuntime{}), value)
+}
+`,
+  });
+  const output = await review(root);
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
+test("fails closed when a mutable field name collides with an unrelated store", async () => {
+  const source = cortexShape("getGoroutineID").replace(
+    "type requestTracker struct{}",
+    `type requestTracker struct{}
+type inertStore struct{}
+func (inertStore) Store(any, any) {}
+type unrelatedHolder struct { trackers inertStore }
+func (h *unrelatedHolder) Record(value any) { h.trackers.Store(getGoroutineID(), value) }`,
+  );
+  const root = await repository({ "collision.go": source });
+  const output = await review(root);
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
+test("anchors a changed goroutine-prefix contract instead of an unchanged key call", async () => {
+  const before = cortexShape("getGoroutineID").replace('"goroutine "', '"thread "');
+  const root = await repository({ "tracking.go": before }, true);
+  await writeFile(join(root, "tracking.go"), before.replace('"thread "', '"goroutine "'));
+
+  const output = await changedReview(root);
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.equal(finding?.evidence[0]?.location?.line, 28);
+  assert.equal(finding?.evidence[0]?.snippet, 'text := strings.TrimPrefix(string(buf[:n]), "goroutine ")');
+});
+
+test("anchors a changed derived-prefix transformation", async () => {
+  const before = cortexShape("getGoroutineID").replace(
+    "id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)",
+    "text = text\n  id, _ := strconv.ParseInt(text, 10, 64)",
+  );
+  const root = await repository({ "tracking.go": before }, true);
+  await writeFile(join(root, "tracking.go"), before.replace("text = text", "text = strings.Fields(text)[0]"));
+
+  const output = await changedReview(root);
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.equal(finding?.evidence[0]?.location?.line, 29);
+  assert.equal(finding?.evidence[0]?.snippet, "text = strings.Fields(text)[0]");
+});
+
 test("requires changed semantic evidence and anchors a changed state-key call", async () => {
   const root = await repository({ "tracking.go": cortexShape("getGoroutineID") }, true);
   await writeFile(join(root, "tracking.go"), cortexShape("getGoroutineID").replace("package sample", "package sample\n\n// unrelated documentation"));

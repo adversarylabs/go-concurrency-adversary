@@ -64,9 +64,11 @@ function analyzeGoroutineIDStateKeys(
 ): void {
   if (file.path.endsWith("_test.go")) return;
   const runtimeAlias = aliases.get("runtime");
-  if (runtimeAlias === undefined) return;
+  const strconvAlias = aliases.get("strconv");
+  const stringsAlias = aliases.get("strings");
+  if (runtimeAlias === undefined || strconvAlias === undefined || stringsAlias === undefined) return;
 
-  const idHelpers = goroutineIDHelpers(root, file.current, runtimeAlias);
+  const idHelpers = goroutineIDHelpers(root, file.current, runtimeAlias, strconvAlias, stringsAlias);
   if (idHelpers.size === 0) return;
 
   const stateReceivers = mutableStateReceivers(root, file.current, aliases.get("sync"));
@@ -84,8 +86,8 @@ function analyzeGoroutineIDStateKeys(
 
     const evidence = isChangedEvidence(file, key.startPosition.row + 1, key.endPosition.row + 1)
       ? key
-      : helperCall.parser;
-    if (!isChangedEvidence(file, evidence.startPosition.row + 1, evidence.endPosition.row + 1)) continue;
+      : changedHelperAnchor(file, helperCall.anchors);
+    if (evidence === undefined) continue;
     const dedupe = `${selected.operand}:${helperCall.helper}`;
     if (seen.has(dedupe)) continue;
     seen.add(dedupe);
@@ -109,8 +111,8 @@ function analyzeGoroutineIDStateKeys(
     if (helperCall === undefined) continue;
     const evidence = isChangedEvidence(file, key.startPosition.row + 1, key.endPosition.row + 1)
       ? key
-      : helperCall.parser;
-    if (!isChangedEvidence(file, evidence.startPosition.row + 1, evidence.endPosition.row + 1)) continue;
+      : changedHelperAnchor(file, helperCall.anchors);
+    if (evidence === undefined) continue;
     const dedupe = `${state}:${helperCall.helper}`;
     if (seen.has(dedupe)) continue;
     seen.add(dedupe);
@@ -137,8 +139,8 @@ function analyzeGoroutineIDStateKeys(
     if (helperCall === undefined) continue;
     const evidence = isChangedEvidence(file, key.startPosition.row + 1, key.endPosition.row + 1)
       ? key
-      : helperCall.parser;
-    if (!isChangedEvidence(file, evidence.startPosition.row + 1, evidence.endPosition.row + 1)) continue;
+      : changedHelperAnchor(file, helperCall.anchors);
+    if (evidence === undefined) continue;
     const dedupe = `${stateText}:${helperCall.helper}`;
     if (seen.has(dedupe)) continue;
     seen.add(dedupe);
@@ -161,40 +163,144 @@ function goroutineIDHelpers(
   root: Node,
   source: string,
   runtimeAlias: string,
-): Map<string, Node> {
-  const helpers = new Map<string, Node>();
+  strconvAlias: string,
+  stringsAlias: string,
+): Map<string, Node[]> {
+  const helpers = new Map<string, Node[]>();
   for (const fn of descendants(root, "function_declaration")) {
     const name = fn.childForFieldName("name");
     const body = fn.childForFieldName("body");
     if (name === null || body === null) continue;
+    if ([runtimeAlias, strconvAlias, stringsAlias].some((alias) => declaresLocalIdentifier(fn, source, alias))) continue;
 
-    const stackCalls = descendants(body, "call_expression").filter((call) => {
+    const stackCalls = functionDescendants(fn, body, "call_expression").filter((call) => {
       const functionNode = call.childForFieldName("function");
       if (functionNode === null || sourceText(functionNode, source) !== `${runtimeAlias}.Stack`) return false;
       const args = call.childForFieldName("arguments")?.namedChildren ?? [];
       return args.length >= 2 && sourceText(args[1]!, source) === "false";
     });
     if (stackCalls.length !== 1) continue;
-    if (!hasGoroutinePrefixLiteral(body, source)) continue;
+    const stackCall = stackCalls[0]!;
+    const stackArgs = stackCall.childForFieldName("arguments")?.namedChildren ?? [];
+    const stackBuffer = stackArgs[0] === undefined ? undefined : sliceOperandIdentifier(stackArgs[0], source);
+    const stackLength = assignedResult(stackCall, source);
+    if (stackBuffer === undefined || stackLength === undefined) continue;
 
-    const integerParses = descendants(body, "call_expression").filter((call) => {
+    const prefixCalls = functionDescendants(fn, body, "call_expression").filter((call) => {
+      const functionNode = call.childForFieldName("function");
+      if (functionNode === null || sourceText(functionNode, source) !== `${stringsAlias}.TrimPrefix`) return false;
+      const args = call.childForFieldName("arguments")?.namedChildren ?? [];
+      return args.length === 2 &&
+        isStackString(args[0]!, source, stackBuffer, stackLength) &&
+        isGoroutinePrefixLiteral(args[1]!, source);
+    });
+    if (prefixCalls.length !== 1) continue;
+    const prefixCall = prefixCalls[0]!;
+    const prefixValue = assignedResult(prefixCall, source);
+    if (prefixValue === undefined) continue;
+    const prefixReassignments = relatedReassignments(fn, body, prefixCall, source, prefixValue);
+    if (prefixReassignments === undefined) continue;
+
+    const integerParses = functionDescendants(fn, body, "call_expression").filter((call) => {
       const functionNode = call.childForFieldName("function");
       if (functionNode === null) return false;
-      return /(?:^|\.)(?:Atoi|ParseInt|ParseUint)$/.test(sourceText(functionNode, source));
+      if (!new RegExp(`^${escapeRegExp(strconvAlias)}\\.(?:Atoi|ParseInt|ParseUint)$`).test(sourceText(functionNode, source))) return false;
+      const firstArgument = call.childForFieldName("arguments")?.namedChildren[0];
+      return firstArgument !== undefined && containsIdentifier(firstArgument, source, prefixValue);
     });
     if (integerParses.length !== 1) continue;
     const parsedID = discardedParseResult(integerParses[0]!, source);
-    if (parsedID === undefined || !descendants(body, "return_statement").some((node) => containsIdentifier(node, source, parsedID))) continue;
-    helpers.set(sourceText(name, source), integerParses[0]!);
+    if (parsedID === undefined || !functionDescendants(fn, body, "return_statement")
+      .some((node) => containsIdentifier(node, source, parsedID))) continue;
+    helpers.set(sourceText(name, source), [stackCall, prefixCall, ...prefixReassignments, integerParses[0]!]);
   }
   return helpers;
 }
 
-function hasGoroutinePrefixLiteral(body: Node, source: string): boolean {
-  return [
-    ...descendants(body, "interpreted_string_literal"),
-    ...descendants(body, "raw_string_literal"),
-  ].some((literal) => /^['"`]goroutine\s/.test(sourceText(literal, source)));
+function assignedResult(call: Node, source: string): string | undefined {
+  const assignment = call.parent?.parent;
+  if (assignment === null || assignment === undefined ||
+      (assignment.type !== "short_var_declaration" && assignment.type !== "assignment_statement")) return undefined;
+  const right = assignment.childForFieldName("right")?.namedChildren ?? [];
+  const left = assignment.childForFieldName("left")?.namedChildren ?? [];
+  if (right.length !== 1 || right[0]?.id !== call.id || left.length !== 1 || left[0]?.type !== "identifier") return undefined;
+  return sourceText(left[0], source);
+}
+
+function sliceOperandIdentifier(node: Node, source: string): string | undefined {
+  if (node.type !== "slice_expression") return undefined;
+  const operand = node.childForFieldName("operand");
+  return operand?.type === "identifier" ? sourceText(operand, source) : undefined;
+}
+
+function isStackString(node: Node, source: string, buffer: string, length: string): boolean {
+  if (node.type !== "call_expression") return false;
+  const fn = node.childForFieldName("function");
+  const args = node.childForFieldName("arguments")?.namedChildren ?? [];
+  if (fn?.type !== "identifier" || sourceText(fn, source) !== "string" || args.length !== 1) return false;
+  const slice = args[0]!;
+  return sliceOperandIdentifier(slice, source) === buffer && containsIdentifier(slice, source, length);
+}
+
+function isGoroutinePrefixLiteral(node: Node, source: string): boolean {
+  if (node.type !== "interpreted_string_literal" && node.type !== "raw_string_literal") return false;
+  const text = sourceText(node, source);
+  return text === '"goroutine "' || text === "`goroutine `";
+}
+
+function functionDescendants(fn: Node, body: Node, type: string): Node[] {
+  return descendants(body, type).filter((node) => {
+    let current = node.parent;
+    while (current !== null && current.id !== fn.id) {
+      if (current.type === "func_literal") return false;
+      current = current.parent;
+    }
+    return current?.id === fn.id;
+  });
+}
+
+function relatedReassignments(fn: Node, body: Node, origin: Node, source: string, name: string): Node[] | undefined {
+  const related: Node[] = [];
+  for (const assignment of [
+    ...functionDescendants(fn, body, "short_var_declaration"),
+    ...functionDescendants(fn, body, "assignment_statement"),
+  ]) {
+    if (assignment.id === origin.parent?.parent?.id) continue;
+    const left = assignment.childForFieldName("left")?.namedChildren ?? [];
+    const indexes = left.flatMap((node, index) =>
+      node.type === "identifier" && sourceText(node, source) === name ? [index] : []);
+    if (indexes.length === 0) continue;
+    const right = assignment.childForFieldName("right")?.namedChildren ?? [];
+    const unrelated = indexes.some((index) => {
+      const value = right.length === left.length ? right[index] : right[0];
+      return value === undefined || !containsIdentifier(value, source, name);
+    });
+    if (unrelated) return undefined;
+    related.push(assignment);
+  }
+  return related;
+}
+
+function declaresLocalIdentifier(fn: Node, source: string, name: string): boolean {
+  for (const declaration of [
+    ...descendants(fn, "parameter_declaration"),
+    ...descendants(fn, "short_var_declaration"),
+    ...descendants(fn, "var_spec"),
+    ...descendants(fn, "range_clause"),
+  ]) {
+    const left = declaration.childForFieldName("left")?.namedChildren ?? [];
+    const named = left.length > 0 ? left : declaration.namedChildren;
+    if (named.some((node) => node.type === "identifier" && sourceText(node, source) === name)) return true;
+  }
+  return false;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function changedHelperAnchor(file: SourceRevision, anchors: Node[]): Node | undefined {
+  return anchors.find((node) => isChangedEvidence(file, node.startPosition.row + 1, node.endPosition.row + 1));
 }
 
 function discardedParseResult(call: Node, source: string): string | undefined {
@@ -214,17 +320,18 @@ function discardedParseResult(call: Node, source: string): string | undefined {
 
 function mutableStateReceivers(root: Node, source: string, syncAlias: string | undefined): Set<string> {
   const receivers = new Set<string>();
+  const conflicts = new Set<string>();
   for (const field of descendants(root, "field_declaration")) {
     const type = field.childForFieldName("type");
-    if (type === null || !isMutableStateType(sourceText(type, source), syncAlias)) continue;
     const names = field.namedChildren.filter((node) => node.type === "field_identifier" || node.type === "identifier");
-    for (const name of names) receivers.add(sourceText(name, source));
+    const mutable = type !== null && isMutableStateType(sourceText(type, source), syncAlias);
+    for (const name of names) (mutable ? receivers : conflicts).add(sourceText(name, source));
   }
   for (const spec of descendants(root, "var_spec")) {
     const type = spec.childForFieldName("type");
-    if (type === null || !isMutableStateType(sourceText(type, source), syncAlias)) continue;
+    const mutable = type !== null && isMutableStateType(sourceText(type, source), syncAlias);
     for (const name of spec.namedChildren.filter((node) => node.type === "identifier")) {
-      receivers.add(sourceText(name, source));
+      (mutable ? receivers : conflicts).add(sourceText(name, source));
     }
   }
   for (const declaration of descendants(root, "short_var_declaration")) {
@@ -232,12 +339,24 @@ function mutableStateReceivers(root: Node, source: string, syncAlias: string | u
     const right = declaration.childForFieldName("right")?.namedChildren ?? [];
     if (left.length !== right.length) continue;
     right.forEach((value, index) => {
+      const name = left[index];
+      if (name === undefined || name.type !== "identifier") return;
       if (isMutableStateInitializer(sourceText(value, source), syncAlias)) {
-        const name = left[index];
-        if (name !== undefined) receivers.add(sourceText(name, source));
+        receivers.add(sourceText(name, source));
+      } else {
+        conflicts.add(sourceText(name, source));
       }
     });
   }
+  for (const parameter of descendants(root, "parameter_declaration")) {
+    const type = parameter.childForFieldName("type");
+    if (type !== null && isMutableStateType(sourceText(type, source), syncAlias)) continue;
+    for (const name of parameter.namedChildren.filter((node) =>
+      node.type === "identifier" && (type === null || node.endIndex <= type.startIndex))) {
+      conflicts.add(sourceText(name, source));
+    }
+  }
+  for (const conflict of conflicts) receivers.delete(conflict);
   return receivers;
 }
 
@@ -254,14 +373,17 @@ function isMutableStateInitializer(value: string, syncAlias: string | undefined)
 function directHelperCall(
   key: Node,
   source: string,
-  helpers: Map<string, Node>,
-): { helper: string; parser: Node } | undefined {
+  helpers: Map<string, Node[]>,
+): { helper: string; anchors: Node[] } | undefined {
   if (key.type !== "call_expression") return undefined;
   const functionNode = key.childForFieldName("function");
   if (functionNode?.type !== "identifier") return undefined;
   const helper = sourceText(functionNode, source);
-  const parser = helpers.get(helper);
-  return parser === undefined ? undefined : { helper, parser };
+  const anchors = helpers.get(helper);
+  if (anchors === undefined) return undefined;
+  const enclosing = findEnclosingFunction(key);
+  if (enclosing !== null && declaresLocalIdentifier(enclosing, source, helper)) return undefined;
+  return { helper, anchors };
 }
 
 function analyzeContextDetachment(
