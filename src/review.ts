@@ -21,6 +21,7 @@ export async function reviewConcurrency(
   const tickers = matching(analysis, "go-concurrency.ticker.not-stopped");
   const timers = matching(analysis, "go-concurrency.timer.not-stopped");
   const atomicCapacity = matching(analysis, "go-concurrency.atomic-capacity-check-update");
+  const goroutineIDStateKeys = matching(analysis, "go-concurrency.goroutine-id-state-key");
   const concurrentApiMissing = matching(analysis, "go-concurrency.concurrent-api.missing-test");
 
   emitGroupedFinding(ctx, deadlocks, {
@@ -144,6 +145,16 @@ export async function reviewConcurrency(
     recommendation: "Make the limit check and reservation one operation with a CAS retry loop, or guard both with the same mutex/semaphore.",
   });
 
+  emitGroupedFinding(ctx, goroutineIDStateKeys, {
+    title: "Mutable state is keyed by a parsed goroutine identifier",
+    category: "reliability",
+    severity: "medium",
+    summary: (count) => `${count} mutable state container${count === 1 ? " is" : "s are"} keyed by an identifier parsed from runtime.Stack output.`,
+    whyItMatters: "Goroutine identity is not a supported application ownership boundary. Parsing stack text couples state lookup to diagnostic output, and an unchecked parse failure can collapse independent operations onto the same zero key.",
+    impact: "Request-owned state can become unavailable or be associated with the wrong operation if identity extraction fails, while the implicit ownership is hard to correlate with the request that created it.",
+    recommendation: "Pass request-scoped state or context through the interface and key ownership with an explicit request handle. If an upstream callback temporarily prevents that, isolate and document the compatibility shim and fail closed when identity parsing fails.",
+  });
+
   emitGroupedFinding(ctx, concurrentApiMissing, {
     title: "Concurrent API guarantee lacks test for overlapping calls",
     category: "correctness",
@@ -170,6 +181,7 @@ export async function reviewConcurrency(
   if (tickers.length > 0) staticSeverities.push("medium");
   if (timers.length > 0) staticSeverities.push(timerSeverity(analysis.goVersion));
   if (atomicCapacity.length > 0) staticSeverities.push("high");
+  if (goroutineIDStateKeys.length > 0) staticSeverities.push("medium");
   if (concurrentApiMissing.length > 0) staticSeverities.push("medium");
   const staticPrimaryConcern =
     deadlocks.length > 0 ? "local channel self-deadlocks" :
@@ -179,6 +191,7 @@ export async function reviewConcurrency(
     waitGroupCopied.length > 0 ? "WaitGroup value copies" :
     loopVars.length > 0 ? "loop variable captures in goroutines" :
     atomicCapacity.length > 0 ? "non-atomic capacity admission" :
+    goroutineIDStateKeys.length > 0 ? "goroutine identifiers used as mutable state keys" :
     cancellation.length > 0 ? "discarded cancellation ownership" :
     detachedContexts.length > 0 ? "operations detached from caller cancellation" :
     cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" :
@@ -213,6 +226,7 @@ export async function reviewConcurrency(
     tickers,
     timers,
     atomicCapacity,
+    goroutineIDStateKeys,
     concurrentApiMissing,
     ...(analysis.goVersion === undefined ? {} : { goVersion: analysis.goVersion }),
   });
@@ -311,6 +325,7 @@ function addAssessment(
     tickers: Signal[];
     timers: Signal[];
     atomicCapacity: Signal[];
+    goroutineIDStateKeys: Signal[];
     concurrentApiMissing: Signal[];
     goVersion?: GoVersion;
   },
@@ -389,6 +404,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would make capacity admission atomic before merging.",
+    });
+    return;
+  }
+  if (groups.goroutineIDStateKeys.length > 0) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "Mutable state ownership depends on a goroutine identifier parsed from diagnostic stack text, and unchecked parse failure can collapse lookups onto a shared zero key.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would replace goroutine-derived state identity with explicit request-scoped ownership before merging.",
     });
     return;
   }

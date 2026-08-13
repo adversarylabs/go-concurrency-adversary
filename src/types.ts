@@ -32,6 +32,7 @@ export interface Signal {
     | "go-concurrency.channel.self-deadlock"
     | "go-concurrency.waitgroup.done-not-deferred"
     | "go-concurrency.atomic-capacity-check-update"
+    | "go-concurrency.goroutine-id-state-key"
     | "go-concurrency.concurrent-api.missing-test";
   path: string;
   line: number;

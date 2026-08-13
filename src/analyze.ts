@@ -37,6 +37,7 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
     const signals: Signal[] = [];
     const positives: PositiveSignal[] = [];
     analyzeContextDetachment(file, tree.rootNode, aliases, signals);
+    analyzeGoroutineIDStateKeys(file, tree.rootNode, aliases, signals);
     for (const fn of [
       ...descendants(tree.rootNode, "function_declaration"),
       ...descendants(tree.rootNode, "method_declaration"),
@@ -53,6 +54,214 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
   } finally {
     tree.delete();
   }
+}
+
+function analyzeGoroutineIDStateKeys(
+  file: SourceRevision,
+  root: Node,
+  aliases: Map<string, string>,
+  signals: Signal[],
+): void {
+  if (file.path.endsWith("_test.go")) return;
+  const runtimeAlias = aliases.get("runtime");
+  if (runtimeAlias === undefined) return;
+
+  const idHelpers = goroutineIDHelpers(root, file.current, runtimeAlias);
+  if (idHelpers.size === 0) return;
+
+  const stateReceivers = mutableStateReceivers(root, file.current, aliases.get("sync"));
+  const seen = new Set<string>();
+  for (const call of descendants(root, "call_expression")) {
+    const selected = selectedCall(call, file.current);
+    if (selected === undefined || !["Store", "Load", "Delete"].includes(selected.field)) continue;
+    if (!stateReceivers.has(receiverName(selected.operand))) continue;
+
+    const args = call.childForFieldName("arguments")?.namedChildren ?? [];
+    const key = args[0];
+    if (key === undefined) continue;
+    const helperCall = directHelperCall(key, file.current, idHelpers);
+    if (helperCall === undefined) continue;
+
+    const evidence = isChangedEvidence(file, key.startPosition.row + 1, key.endPosition.row + 1)
+      ? key
+      : helperCall.parser;
+    if (!isChangedEvidence(file, evidence.startPosition.row + 1, evidence.endPosition.row + 1)) continue;
+    const dedupe = `${selected.operand}:${helperCall.helper}`;
+    if (seen.has(dedupe)) continue;
+    seen.add(dedupe);
+    signals.push(signal(file, evidence, "go-concurrency.goroutine-id-state-key",
+      `${selected.operand}.${selected.field} keys mutable state with a goroutine identifier parsed from runtime.Stack text.`, {
+        state: selected.operand,
+        operation: selected.field,
+        helper: helperCall.helper,
+        parseFailure: "shared-zero-key-if-unchecked",
+        form: "runtime-stack-goroutine-id-state-key",
+      }));
+  }
+
+  for (const index of descendants(root, "index_expression")) {
+    const operand = index.childForFieldName("operand");
+    const key = index.childForFieldName("index");
+    if (operand === null || key === null) continue;
+    const state = sourceText(operand, file.current);
+    if (!stateReceivers.has(receiverName(state))) continue;
+    const helperCall = directHelperCall(key, file.current, idHelpers);
+    if (helperCall === undefined) continue;
+    const evidence = isChangedEvidence(file, key.startPosition.row + 1, key.endPosition.row + 1)
+      ? key
+      : helperCall.parser;
+    if (!isChangedEvidence(file, evidence.startPosition.row + 1, evidence.endPosition.row + 1)) continue;
+    const dedupe = `${state}:${helperCall.helper}`;
+    if (seen.has(dedupe)) continue;
+    seen.add(dedupe);
+    signals.push(signal(file, evidence, "go-concurrency.goroutine-id-state-key",
+      `${state} indexes mutable state with a goroutine identifier parsed from runtime.Stack text.`, {
+        state,
+        operation: index.parent?.type === "assignment_statement" ? "write" : "read",
+        helper: helperCall.helper,
+        parseFailure: "shared-zero-key-if-unchecked",
+        form: "runtime-stack-goroutine-id-state-key",
+      }));
+  }
+
+  for (const call of descendants(root, "call_expression")) {
+    const functionNode = call.childForFieldName("function");
+    if (functionNode?.type !== "identifier" || sourceText(functionNode, file.current) !== "delete") continue;
+    const args = call.childForFieldName("arguments")?.namedChildren ?? [];
+    const state = args[0];
+    const key = args[1];
+    if (state === undefined || key === undefined) continue;
+    const stateText = sourceText(state, file.current);
+    if (!stateReceivers.has(receiverName(stateText))) continue;
+    const helperCall = directHelperCall(key, file.current, idHelpers);
+    if (helperCall === undefined) continue;
+    const evidence = isChangedEvidence(file, key.startPosition.row + 1, key.endPosition.row + 1)
+      ? key
+      : helperCall.parser;
+    if (!isChangedEvidence(file, evidence.startPosition.row + 1, evidence.endPosition.row + 1)) continue;
+    const dedupe = `${stateText}:${helperCall.helper}`;
+    if (seen.has(dedupe)) continue;
+    seen.add(dedupe);
+    signals.push(signal(file, evidence, "go-concurrency.goroutine-id-state-key",
+      `${stateText} deletes mutable state with a goroutine identifier parsed from runtime.Stack text.`, {
+        state: stateText,
+        operation: "delete",
+        helper: helperCall.helper,
+        parseFailure: "shared-zero-key-if-unchecked",
+        form: "runtime-stack-goroutine-id-state-key",
+      }));
+  }
+}
+
+function receiverName(expression: string): string {
+  return expression.split(".").at(-1) ?? expression;
+}
+
+function goroutineIDHelpers(
+  root: Node,
+  source: string,
+  runtimeAlias: string,
+): Map<string, Node> {
+  const helpers = new Map<string, Node>();
+  for (const fn of descendants(root, "function_declaration")) {
+    const name = fn.childForFieldName("name");
+    const body = fn.childForFieldName("body");
+    if (name === null || body === null) continue;
+
+    const stackCalls = descendants(body, "call_expression").filter((call) => {
+      const functionNode = call.childForFieldName("function");
+      if (functionNode === null || sourceText(functionNode, source) !== `${runtimeAlias}.Stack`) return false;
+      const args = call.childForFieldName("arguments")?.namedChildren ?? [];
+      return args.length >= 2 && sourceText(args[1]!, source) === "false";
+    });
+    if (stackCalls.length !== 1) continue;
+    if (!hasGoroutinePrefixLiteral(body, source)) continue;
+
+    const integerParses = descendants(body, "call_expression").filter((call) => {
+      const functionNode = call.childForFieldName("function");
+      if (functionNode === null) return false;
+      return /(?:^|\.)(?:Atoi|ParseInt|ParseUint)$/.test(sourceText(functionNode, source));
+    });
+    if (integerParses.length !== 1) continue;
+    const parsedID = discardedParseResult(integerParses[0]!, source);
+    if (parsedID === undefined || !descendants(body, "return_statement").some((node) => containsIdentifier(node, source, parsedID))) continue;
+    helpers.set(sourceText(name, source), integerParses[0]!);
+  }
+  return helpers;
+}
+
+function hasGoroutinePrefixLiteral(body: Node, source: string): boolean {
+  return [
+    ...descendants(body, "interpreted_string_literal"),
+    ...descendants(body, "raw_string_literal"),
+  ].some((literal) => /^['"`]goroutine\s/.test(sourceText(literal, source)));
+}
+
+function discardedParseResult(call: Node, source: string): string | undefined {
+  let current = call.parent;
+  while (current !== null && current.type !== "short_var_declaration" && current.type !== "assignment_statement") {
+    if (current.type === "statement_list" || current.type === "block") return undefined;
+    current = current.parent;
+  }
+  if (current === null) return undefined;
+  const left = current.childForFieldName("left")?.namedChildren ?? [];
+  const right = current.childForFieldName("right")?.namedChildren ?? [];
+  if (right.length !== 1 || right[0]?.id !== call.id || left.length < 2 || sourceText(left[1]!, source) !== "_") {
+    return undefined;
+  }
+  return sourceText(left[0]!, source);
+}
+
+function mutableStateReceivers(root: Node, source: string, syncAlias: string | undefined): Set<string> {
+  const receivers = new Set<string>();
+  for (const field of descendants(root, "field_declaration")) {
+    const type = field.childForFieldName("type");
+    if (type === null || !isMutableStateType(sourceText(type, source), syncAlias)) continue;
+    const names = field.namedChildren.filter((node) => node.type === "field_identifier" || node.type === "identifier");
+    for (const name of names) receivers.add(sourceText(name, source));
+  }
+  for (const spec of descendants(root, "var_spec")) {
+    const type = spec.childForFieldName("type");
+    if (type === null || !isMutableStateType(sourceText(type, source), syncAlias)) continue;
+    for (const name of spec.namedChildren.filter((node) => node.type === "identifier")) {
+      receivers.add(sourceText(name, source));
+    }
+  }
+  for (const declaration of descendants(root, "short_var_declaration")) {
+    const left = declaration.childForFieldName("left")?.namedChildren ?? [];
+    const right = declaration.childForFieldName("right")?.namedChildren ?? [];
+    if (left.length !== right.length) continue;
+    right.forEach((value, index) => {
+      if (isMutableStateInitializer(sourceText(value, source), syncAlias)) {
+        const name = left[index];
+        if (name !== undefined) receivers.add(sourceText(name, source));
+      }
+    });
+  }
+  return receivers;
+}
+
+function isMutableStateType(type: string, syncAlias: string | undefined): boolean {
+  return /^map\s*\[/.test(type) || (syncAlias !== undefined && type === `${syncAlias}.Map`);
+}
+
+function isMutableStateInitializer(value: string, syncAlias: string | undefined): boolean {
+  return /^make\s*\(\s*map\s*\[/.test(value) ||
+    /^map\s*\[.*\]\s*.*\{/.test(value) ||
+    (syncAlias !== undefined && new RegExp(`^&?${syncAlias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.Map\\s*\\{`).test(value));
+}
+
+function directHelperCall(
+  key: Node,
+  source: string,
+  helpers: Map<string, Node>,
+): { helper: string; parser: Node } | undefined {
+  if (key.type !== "call_expression") return undefined;
+  const functionNode = key.childForFieldName("function");
+  if (functionNode?.type !== "identifier") return undefined;
+  const helper = sourceText(functionNode, source);
+  const parser = helpers.get(helper);
+  return parser === undefined ? undefined : { helper, parser };
 }
 
 function analyzeContextDetachment(

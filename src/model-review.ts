@@ -26,6 +26,7 @@ Authority:
 - goroutine lifecycle that can leak or race on shutdown
 - shared memory without synchronization when evidence is clear
 - capacity admission that reads an atomic counter, checks a max/limit, then increments separately; atomic operations do not make the compound check-and-update atomic. Accept a mutex, semaphore, or CAS retry that combines the check and reservation.
+- production mutable state keyed by a goroutine identifier parsed from runtime.Stack diagnostic text; require both the parser and state-key use. Do not object to ordinary stack diagnostics, pprof/trace, tests, or debug-only goroutine-affinity assertions.
 
 Do NOT review generic style, HTTP, security tokens, or databases.
 Prefer silence. Zero to six observations. Cite only evidenceIds.
