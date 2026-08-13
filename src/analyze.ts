@@ -71,12 +71,12 @@ function analyzeGoroutineIDStateKeys(
   const idHelpers = goroutineIDHelpers(root, file.current, runtimeAlias, strconvAlias, stringsAlias);
   if (idHelpers.size === 0) return;
 
-  const stateReceivers = mutableStateReceivers(root, file.current, aliases.get("sync"));
+  const mutableState = mutableStateIndex(root, file.current, aliases.get("sync"));
   const seen = new Set<string>();
   for (const call of descendants(root, "call_expression")) {
     const selected = selectedCall(call, file.current);
     if (selected === undefined || !["Store", "Load", "Delete"].includes(selected.field)) continue;
-    if (!stateReceivers.has(receiverName(selected.operand))) continue;
+    if (!isMutableStateExpression(selected.operandNode, mutableState)) continue;
 
     const args = call.childForFieldName("arguments")?.namedChildren ?? [];
     const key = args[0];
@@ -106,7 +106,7 @@ function analyzeGoroutineIDStateKeys(
     const key = index.childForFieldName("index");
     if (operand === null || key === null) continue;
     const state = sourceText(operand, file.current);
-    if (!stateReceivers.has(receiverName(state))) continue;
+    if (!isMutableStateExpression(operand, mutableState)) continue;
     const helperCall = directHelperCall(key, file.current, idHelpers);
     if (helperCall === undefined) continue;
     const evidence = isChangedEvidence(file, key.startPosition.row + 1, key.endPosition.row + 1)
@@ -134,7 +134,7 @@ function analyzeGoroutineIDStateKeys(
     const key = args[1];
     if (state === undefined || key === undefined) continue;
     const stateText = sourceText(state, file.current);
-    if (!stateReceivers.has(receiverName(stateText))) continue;
+    if (!isMutableStateExpression(state, mutableState)) continue;
     const helperCall = directHelperCall(key, file.current, idHelpers);
     if (helperCall === undefined) continue;
     const evidence = isChangedEvidence(file, key.startPosition.row + 1, key.endPosition.row + 1)
@@ -155,10 +155,6 @@ function analyzeGoroutineIDStateKeys(
   }
 }
 
-function receiverName(expression: string): string {
-  return expression.split(".").at(-1) ?? expression;
-}
-
 function goroutineIDHelpers(
   root: Node,
   source: string,
@@ -171,7 +167,7 @@ function goroutineIDHelpers(
     const name = fn.childForFieldName("name");
     const body = fn.childForFieldName("body");
     if (name === null || body === null) continue;
-    if ([runtimeAlias, strconvAlias, stringsAlias].some((alias) => declaresLocalIdentifier(fn, source, alias))) continue;
+    if ([runtimeAlias, strconvAlias, stringsAlias, "string"].some((alias) => declaresLocalIdentifier(fn, source, alias))) continue;
 
     const stackCalls = functionDescendants(fn, body, "call_expression").filter((call) => {
       const functionNode = call.childForFieldName("function");
@@ -184,7 +180,8 @@ function goroutineIDHelpers(
     const stackArgs = stackCall.childForFieldName("arguments")?.namedChildren ?? [];
     const stackBuffer = stackArgs[0] === undefined ? undefined : sliceOperandIdentifier(stackArgs[0], source);
     const stackLength = assignedResult(stackCall, source);
-    if (stackBuffer === undefined || stackLength === undefined) continue;
+    if (stackBuffer === undefined || stackLength === undefined || stackLength === "_" ||
+        stackArgs[0] === undefined || !isFullSlice(stackArgs[0])) continue;
 
     const prefixCalls = functionDescendants(fn, body, "call_expression").filter((call) => {
       const functionNode = call.childForFieldName("function");
@@ -196,6 +193,8 @@ function goroutineIDHelpers(
     });
     if (prefixCalls.length !== 1) continue;
     const prefixCall = prefixCalls[0]!;
+    if (identifierReassignedBetween(fn, body, stackCall, prefixCall, source, stackBuffer) ||
+        identifierReassignedBetween(fn, body, stackCall, prefixCall, source, stackLength)) continue;
     const prefixValue = assignedResult(prefixCall, source);
     if (prefixValue === undefined) continue;
     const prefixReassignments = relatedReassignments(fn, body, prefixCall, source, prefixValue);
@@ -212,6 +211,8 @@ function goroutineIDHelpers(
     const parsedID = discardedParseResult(integerParses[0]!, source);
     if (parsedID === undefined || !functionDescendants(fn, body, "return_statement")
       .some((node) => containsIdentifier(node, source, parsedID))) continue;
+    if (identifierReassignedAfter(fn, body, integerParses[0]!, source, parsedID)) continue;
+    if (hasTerminatingZeroGuard(fn, body, integerParses[0]!, parsedID, source)) continue;
     helpers.set(sourceText(name, source), [stackCall, prefixCall, ...prefixReassignments, integerParses[0]!]);
   }
   return helpers;
@@ -233,13 +234,22 @@ function sliceOperandIdentifier(node: Node, source: string): string | undefined 
   return operand?.type === "identifier" ? sourceText(operand, source) : undefined;
 }
 
+function isFullSlice(node: Node): boolean {
+  return node.type === "slice_expression" && node.childForFieldName("start") === null &&
+    node.childForFieldName("end") === null && node.childForFieldName("capacity") === null;
+}
+
 function isStackString(node: Node, source: string, buffer: string, length: string): boolean {
   if (node.type !== "call_expression") return false;
   const fn = node.childForFieldName("function");
   const args = node.childForFieldName("arguments")?.namedChildren ?? [];
   if (fn?.type !== "identifier" || sourceText(fn, source) !== "string" || args.length !== 1) return false;
   const slice = args[0]!;
-  return sliceOperandIdentifier(slice, source) === buffer && containsIdentifier(slice, source, length);
+  const start = slice.childForFieldName("start");
+  const end = slice.childForFieldName("end");
+  return sliceOperandIdentifier(slice, source) === buffer && start === null &&
+    end?.type === "identifier" && sourceText(end, source) === length &&
+    slice.childForFieldName("capacity") === null;
 }
 
 function isGoroutinePrefixLiteral(node: Node, source: string): boolean {
@@ -257,6 +267,90 @@ function functionDescendants(fn: Node, body: Node, type: string): Node[] {
     }
     return current?.id === fn.id;
   });
+}
+
+function findEnclosingCallable(node: Node): Node | null {
+  let current: Node | null = node;
+  while (current !== null) {
+    if (current.type === "function_declaration" || current.type === "method_declaration" || current.type === "func_literal") {
+      return current;
+    }
+    current = current.parent;
+  }
+  return null;
+}
+
+function callableParameterDeclarations(fn: Node): Node[] {
+  const lists = [fn.childForFieldName("receiver"), fn.childForFieldName("parameters")];
+  return lists.flatMap((list) => list?.namedChildren.filter((node) => node.type === "parameter_declaration") ?? []);
+}
+
+function hasTerminatingZeroGuard(fn: Node, body: Node, parser: Node, parsedID: string, source: string): boolean {
+  const parserStatements = nearestAncestor(parser, "statement_list");
+  return functionDescendants(fn, body, "if_statement").some((statement) => {
+    if (statement.startIndex <= parser.endIndex) return false;
+    if (parserStatements === null || statement.parent?.id !== parserStatements.id) return false;
+    const condition = statement.childForFieldName("condition");
+    return condition !== null && isParsedIDZeroCondition(condition, parsedID, source) &&
+      guardTerminates(statement, fn, source, false);
+  });
+}
+
+function hasTerminatingKeyGuard(
+  fn: Node,
+  body: Node,
+  assignment: Node,
+  use: Node,
+  key: string,
+  source: string,
+): boolean {
+  return functionDescendants(fn, body, "if_statement").some((statement) => {
+    if (statement.startIndex <= assignment.endIndex || statement.endIndex >= use.startIndex) return false;
+    const guardStatements = statement.parent;
+    if (guardStatements?.type !== "statement_list" ||
+        use.startIndex < guardStatements.startIndex || use.endIndex > guardStatements.endIndex) return false;
+    const condition = statement.childForFieldName("condition");
+    return condition !== null && isParsedIDZeroCondition(condition, key, source) && guardTerminates(statement, fn, source, true);
+  });
+}
+
+function guardTerminates(statement: Node, boundary: Node, source: string, allowReturn: boolean): boolean {
+  const consequence = statement.childForFieldName("consequence");
+  if (consequence === null) return false;
+  const statements = consequence.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
+  const final = statements.at(-1);
+  if (allowReturn && final?.type === "return_statement") return true;
+  if (final?.type === "continue_statement") return hasAncestorBefore(final, "for_statement", boundary);
+  if (final?.type !== "expression_statement") return false;
+  const call = final.namedChildren[0];
+  const callee = call?.type === "call_expression" ? call.childForFieldName("function") : null;
+  return callee?.type === "identifier" && sourceText(callee, source) === "panic" && isBuiltinPanic(boundary, source);
+}
+
+function isBuiltinPanic(boundary: Node, source: string): boolean {
+  if (declaresLocalIdentifier(boundary, source, "panic")) return false;
+  let root = boundary;
+  while (root.parent !== null) root = root.parent;
+  return !descendants(root, "function_declaration").some((fn) => {
+    const name = fn.childForFieldName("name");
+    return name !== null && sourceText(name, source) === "panic";
+  }) && !descendants(root, "var_spec").some((spec) =>
+    findEnclosingCallable(spec) === null && directDeclaredNames(spec, source).includes("panic"));
+}
+
+function isParsedIDZeroCondition(condition: Node, parsedID: string, source: string): boolean {
+  const compact = sourceText(condition, source).replace(/\s+/g, "").replace(/^\((.*)\)$/, "$1");
+  const id = escapeRegExp(parsedID);
+  return new RegExp(`^(?:${id}(?:==|<=)0|0==${id})$`).test(compact);
+}
+
+function hasAncestorBefore(node: Node, type: string, boundary: Node): boolean {
+  let current = node.parent;
+  while (current !== null && current.id !== boundary.id) {
+    if (current.type === type) return true;
+    current = current.parent;
+  }
+  return false;
 }
 
 function relatedReassignments(fn: Node, body: Node, origin: Node, source: string, name: string): Node[] | undefined {
@@ -281,13 +375,43 @@ function relatedReassignments(fn: Node, body: Node, origin: Node, source: string
   return related;
 }
 
+function identifierReassignedBetween(
+  fn: Node,
+  body: Node,
+  from: Node,
+  to: Node,
+  source: string,
+  name: string,
+): boolean {
+  return identifierAssignments(fn, body, source, name)
+    .some((assignment) => assignment.startIndex > from.endIndex && assignment.endIndex < to.startIndex);
+}
+
+function identifierReassignedAfter(fn: Node, body: Node, from: Node, source: string, name: string): boolean {
+  return identifierAssignments(fn, body, source, name).some((assignment) => assignment.startIndex > from.endIndex);
+}
+
+function identifierAssignments(fn: Node, body: Node, source: string, name: string): Node[] {
+  return [
+    ...functionDescendants(fn, body, "short_var_declaration"),
+    ...functionDescendants(fn, body, "assignment_statement"),
+  ].filter((assignment) => {
+    const left = assignment.childForFieldName("left")?.namedChildren ?? [];
+    return left.some((node) => node.type === "identifier" && sourceText(node, source) === name);
+  });
+}
+
 function declaresLocalIdentifier(fn: Node, source: string, name: string): boolean {
-  for (const declaration of [
-    ...descendants(fn, "parameter_declaration"),
-    ...descendants(fn, "short_var_declaration"),
-    ...descendants(fn, "var_spec"),
-    ...descendants(fn, "range_clause"),
-  ]) {
+  const body = fn.childForFieldName("body");
+  const declarations = [
+    ...callableParameterDeclarations(fn),
+    ...(body === null ? [] : [
+      ...functionDescendants(fn, body, "short_var_declaration"),
+      ...functionDescendants(fn, body, "var_spec"),
+      ...functionDescendants(fn, body, "range_clause"),
+    ]),
+  ];
+  for (const declaration of declarations) {
     const left = declaration.childForFieldName("left")?.namedChildren ?? [];
     const named = left.length > 0 ? left : declaration.namedChildren;
     if (named.some((node) => node.type === "identifier" && sourceText(node, source) === name)) return true;
@@ -318,50 +442,154 @@ function discardedParseResult(call: Node, source: string): string | undefined {
   return sourceText(left[0]!, source);
 }
 
-function mutableStateReceivers(root: Node, source: string, syncAlias: string | undefined): Set<string> {
-  const receivers = new Set<string>();
-  const conflicts = new Set<string>();
-  for (const field of descendants(root, "field_declaration")) {
-    const type = field.childForFieldName("type");
-    const names = field.namedChildren.filter((node) => node.type === "field_identifier" || node.type === "identifier");
-    const mutable = type !== null && isMutableStateType(sourceText(type, source), syncAlias);
-    for (const name of names) (mutable ? receivers : conflicts).add(sourceText(name, source));
-  }
-  for (const spec of descendants(root, "var_spec")) {
+interface MutableStateIndex {
+  root: Node;
+  source: string;
+  syncAlias: string | undefined;
+  fields: Map<string, Set<string>>;
+}
+
+interface IdentifierBinding {
+  mutable: boolean;
+  namedType?: string;
+}
+
+function mutableStateIndex(root: Node, source: string, syncAlias: string | undefined): MutableStateIndex {
+  const fields = new Map<string, Set<string>>();
+  for (const spec of descendants(root, "type_spec")) {
+    const name = spec.childForFieldName("name");
     const type = spec.childForFieldName("type");
-    const mutable = type !== null && isMutableStateType(sourceText(type, source), syncAlias);
-    for (const name of spec.namedChildren.filter((node) => node.type === "identifier")) {
-      (mutable ? receivers : conflicts).add(sourceText(name, source));
+    if (name === null || type?.type !== "struct_type") continue;
+    const typeName = sourceText(name, source);
+    for (const field of descendants(type, "field_declaration")) {
+      if (nearestAncestor(field, "struct_type")?.id !== type.id) continue;
+      const fieldType = field.childForFieldName("type");
+      if (fieldType === null || !isMutableStateType(sourceText(fieldType, source), syncAlias)) continue;
+      for (const fieldName of directDeclaredNames(field, source)) {
+        const names = fields.get(typeName) ?? new Set<string>();
+        names.add(fieldName);
+        fields.set(typeName, names);
+      }
     }
   }
-  for (const declaration of descendants(root, "short_var_declaration")) {
+  return { root, source, syncAlias, fields };
+}
+
+function isMutableStateExpression(node: Node, index: MutableStateIndex): boolean {
+  if (node.type === "identifier") {
+    return resolveIdentifierBinding(sourceText(node, index.source), node, index)?.mutable === true;
+  }
+  if (node.type !== "selector_expression") return false;
+  const receiver = node.childForFieldName("operand");
+  const field = node.childForFieldName("field");
+  if (receiver?.type !== "identifier" || field === null) return false;
+  const receiverType = resolveIdentifierBinding(sourceText(receiver, index.source), node, index)?.namedType;
+  return receiverType !== undefined && index.fields.get(receiverType)?.has(sourceText(field, index.source)) === true;
+}
+
+function resolveIdentifierBinding(name: string, use: Node, index: MutableStateIndex): IdentifierBinding | undefined {
+  const callable = findEnclosingCallable(use);
+  if (callable !== null) {
+    const body = callable.childForFieldName("body");
+    if (body !== null) {
+      const locals = [
+        ...functionDescendants(callable, body, "var_spec"),
+        ...functionDescendants(callable, body, "short_var_declaration"),
+      ].filter((declaration) => declaration.startIndex < use.startIndex && declarationVisibleAt(declaration, use))
+        .flatMap((declaration) => {
+          const binding = bindingFromDeclaration(declaration, name, index);
+          return binding === undefined ? [] : [{ binding, start: declaration.startIndex }];
+        })
+        .sort((left, right) => right.start - left.start);
+      if (locals[0] !== undefined) return locals[0].binding;
+    }
+    for (const parameter of callableParameterDeclarations(callable)) {
+      if (!directDeclaredNames(parameter, index.source).includes(name)) continue;
+      const type = parameter.childForFieldName("type");
+      if (type !== null) return bindingFromType(type, index);
+    }
+  }
+
+  const globals = descendants(index.root, "var_spec")
+    .filter((spec) => findEnclosingCallable(spec) === null && spec.startIndex < use.startIndex)
+    .flatMap((spec) => {
+      const binding = bindingFromDeclaration(spec, name, index);
+      return binding === undefined ? [] : [{ binding, start: spec.startIndex }];
+    })
+    .sort((left, right) => right.start - left.start);
+  return globals[0]?.binding;
+}
+
+function bindingFromDeclaration(declaration: Node, name: string, index: MutableStateIndex): IdentifierBinding | undefined {
+  if (declaration.type === "var_spec") {
+    const names = directDeclaredNames(declaration, index.source);
+    const offset = names.indexOf(name);
+    if (offset < 0) return undefined;
+    const type = declaration.childForFieldName("type");
+    if (type !== null) return bindingFromType(type, index);
+    const values = declaration.namedChildren.find((node) => node.type === "expression_list")?.namedChildren ?? [];
+    const value = values.length === names.length ? values[offset] : values[0];
+    return value === undefined ? { mutable: false } : bindingFromValue(value, index);
+  }
+  if (declaration.type === "short_var_declaration") {
     const left = declaration.childForFieldName("left")?.namedChildren ?? [];
     const right = declaration.childForFieldName("right")?.namedChildren ?? [];
-    if (left.length !== right.length) continue;
-    right.forEach((value, index) => {
-      const name = left[index];
-      if (name === undefined || name.type !== "identifier") return;
-      if (isMutableStateInitializer(sourceText(value, source), syncAlias)) {
-        receivers.add(sourceText(name, source));
-      } else {
-        conflicts.add(sourceText(name, source));
-      }
-    });
+    const offset = left.findIndex((node) => node.type === "identifier" && sourceText(node, index.source) === name);
+    if (offset < 0) return undefined;
+    const value = right.length === left.length ? right[offset] : right[0];
+    return value === undefined ? { mutable: false } : bindingFromValue(value, index);
   }
-  for (const parameter of descendants(root, "parameter_declaration")) {
-    const type = parameter.childForFieldName("type");
-    if (type !== null && isMutableStateType(sourceText(type, source), syncAlias)) continue;
-    for (const name of parameter.namedChildren.filter((node) =>
-      node.type === "identifier" && (type === null || node.endIndex <= type.startIndex))) {
-      conflicts.add(sourceText(name, source));
-    }
+  return undefined;
+}
+
+function bindingFromType(type: Node, index: MutableStateIndex): IdentifierBinding {
+  const text = sourceText(type, index.source);
+  const resolved = namedType(text);
+  return { mutable: isMutableStateType(text, index.syncAlias), ...(resolved === undefined ? {} : { namedType: resolved }) };
+}
+
+function bindingFromValue(value: Node, index: MutableStateIndex): IdentifierBinding {
+  const text = sourceText(value, index.source);
+  const type = initializedNamedType(text);
+  return { mutable: isMutableStateInitializer(text, index.syncAlias), ...(type === undefined ? {} : { namedType: type }) };
+}
+
+function directDeclaredNames(declaration: Node, source: string): string[] {
+  const type = declaration.childForFieldName("type");
+  return declaration.namedChildren
+    .filter((node) => (node.type === "identifier" || node.type === "field_identifier") &&
+      (type === null || node.endIndex <= type.startIndex))
+    .map((node) => sourceText(node, source));
+}
+
+function declarationVisibleAt(declaration: Node, use: Node): boolean {
+  let scope = declaration.parent;
+  while (scope !== null && scope.type !== "block" && scope.type !== "source_file") scope = scope.parent;
+  return scope !== null && use.startIndex >= scope.startIndex && use.endIndex <= scope.endIndex;
+}
+
+function nearestAncestor(node: Node, type: string): Node | null {
+  let current = node.parent;
+  while (current !== null) {
+    if (current.type === type) return current;
+    current = current.parent;
   }
-  for (const conflict of conflicts) receivers.delete(conflict);
-  return receivers;
+  return null;
+}
+
+function namedType(type: string): string | undefined {
+  const normalized = type.replace(/[\s*()]/g, "");
+  return /^[A-Za-z_]\w*$/.test(normalized) ? normalized : undefined;
+}
+
+function initializedNamedType(value: string): string | undefined {
+  return /^&?([A-Za-z_]\w*)\s*\{/.exec(value.trim())?.[1];
 }
 
 function isMutableStateType(type: string, syncAlias: string | undefined): boolean {
-  return /^map\s*\[/.test(type) || (syncAlias !== undefined && type === `${syncAlias}.Map`);
+  const normalized = type.replace(/\s+/g, "");
+  return /^map\[/.test(normalized) ||
+    (syncAlias !== undefined && (normalized === `${syncAlias}.Map` || normalized === `*${syncAlias}.Map`));
 }
 
 function isMutableStateInitializer(value: string, syncAlias: string | undefined): boolean {
@@ -375,13 +603,43 @@ function directHelperCall(
   source: string,
   helpers: Map<string, Node[]>,
 ): { helper: string; anchors: Node[] } | undefined {
-  if (key.type !== "call_expression") return undefined;
-  const functionNode = key.childForFieldName("function");
+  if (key.type === "call_expression") return helperCall(key, source, helpers);
+  if (key.type !== "identifier") return undefined;
+  const enclosing = findEnclosingCallable(key);
+  const body = enclosing?.childForFieldName("body");
+  if (enclosing === null || enclosing === undefined || body === null || body === undefined) return undefined;
+  const keyName = sourceText(key, source);
+  const assignments = [
+    ...functionDescendants(enclosing, body, "short_var_declaration"),
+    ...functionDescendants(enclosing, body, "assignment_statement"),
+  ].filter((assignment) => assignment.startIndex < key.startIndex && declarationVisibleAt(assignment, key))
+    .flatMap((assignment) => {
+      const left = assignment.childForFieldName("left")?.namedChildren ?? [];
+      const right = assignment.childForFieldName("right")?.namedChildren ?? [];
+      const offset = left.findIndex((node) => node.type === "identifier" && sourceText(node, source) === keyName);
+      if (offset < 0) return [];
+      const value = right.length === left.length ? right[offset] : right[0];
+      return [{ assignment, value }];
+    })
+    .sort((left, right) => right.assignment.startIndex - left.assignment.startIndex);
+  const match = assignments[0];
+  if (match?.value?.type !== "call_expression") return undefined;
+  const resolved = helperCall(match.value, source, helpers);
+  if (resolved === undefined || hasTerminatingKeyGuard(enclosing, body, match.assignment, key, keyName, source)) return undefined;
+  return { helper: resolved.helper, anchors: [...resolved.anchors, match.assignment] };
+}
+
+function helperCall(
+  call: Node,
+  source: string,
+  helpers: Map<string, Node[]>,
+): { helper: string; anchors: Node[] } | undefined {
+  const functionNode = call.childForFieldName("function");
   if (functionNode?.type !== "identifier") return undefined;
   const helper = sourceText(functionNode, source);
   const anchors = helpers.get(helper);
   if (anchors === undefined) return undefined;
-  const enclosing = findEnclosingFunction(key);
+  const enclosing = findEnclosingCallable(call);
   if (enclosing !== null && declaresLocalIdentifier(enclosing, source, helper)) return undefined;
   return { helper, anchors };
 }
@@ -493,7 +751,7 @@ function atomicAccessorMethods(
     if (returns.length !== 1) continue;
     const loads = descendants(returns[0]!, "call_expression")
       .map((call) => selectedCall(call, source))
-      .filter((call): call is { operand: string; field: string } => call !== undefined && call.field === "Load");
+      .filter((call): call is { operand: string; operandNode: Node; field: string } => call !== undefined && call.field === "Load");
     if (loads.length !== 1) continue;
     const field = loads[0]!.operand.split(".").at(-1);
     if (field !== undefined) result.set(sourceText(name, source), field);
@@ -556,13 +814,13 @@ function analyzeAtomicCapacityAdmission(
   }
 }
 
-function selectedCall(call: Node, source: string): { operand: string; field: string } | undefined {
+function selectedCall(call: Node, source: string): { operand: string; operandNode: Node; field: string } | undefined {
   const fn = call.childForFieldName("function");
   if (fn?.type !== "selector_expression") return undefined;
   const operand = fn.childForFieldName("operand");
   const field = fn.childForFieldName("field");
   if (operand === null || field === null) return undefined;
-  return { operand: sourceText(operand, source), field: sourceText(field, source) };
+  return { operand: sourceText(operand, source), operandNode: operand, field: sourceText(field, source) };
 }
 
 function analyzeCopyLocks(

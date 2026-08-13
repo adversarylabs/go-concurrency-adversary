@@ -191,11 +191,38 @@ func nestedReturnOnly() int64 {
   return 7
 }
 
+func wrongSliceLowerBound() int64 {
+  var buf [64]byte
+  n := runtime.Stack(buf[:], false)
+  text := strings.TrimPrefix(string(buf[n:]), "goroutine ")
+  id, _ := strconv.ParseInt(text, 10, 64)
+  return id
+}
+
+func wrongSliceWindow() int64 {
+  var buf [64]byte
+  n := runtime.Stack(buf[:], false)
+  text := strings.TrimPrefix(string(buf[1:n]), "goroutine ")
+  id, _ := strconv.ParseInt(text, 10, 64)
+  return id
+}
+
+func wrongSliceCapacity() int64 {
+  var buf [64]byte
+  n := runtime.Stack(buf[:], false)
+  text := strings.TrimPrefix(string(buf[:n:cap(buf)]), "goroutine ")
+  id, _ := strconv.ParseInt(text, 10, 64)
+  return id
+}
+
 func (h *holder) Store(value any) {
   h.trackers.Store(unrelatedParse(), value)
   h.trackers.Store(reassignedStackText(), value)
   h.trackers.Store(customParser(), value)
   h.trackers.Store(nestedReturnOnly(), value)
+  h.trackers.Store(wrongSliceLowerBound(), value)
+  h.trackers.Store(wrongSliceWindow(), value)
+  h.trackers.Store(wrongSliceCapacity(), value)
 }
 `,
   });
@@ -279,7 +306,7 @@ func (h *holder) Store(value any) {
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
 });
 
-test("fails closed when a mutable field name collides with an unrelated store", async () => {
+test("binds mutable fields to the exact receiver type despite a same-named custom store", async () => {
   const source = cortexShape("getGoroutineID").replace(
     "type requestTracker struct{}",
     `type requestTracker struct{}
@@ -290,7 +317,133 @@ func (h *unrelatedHolder) Record(value any) { h.trackers.Store(getGoroutineID(),
   );
   const root = await repository({ "collision.go": source });
   const output = await review(root);
-  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.equal(finding?.evidence.length, 1);
+  assert.equal(finding?.evidence[0]?.snippet, "h.trackers.Store(getGoroutineID(), tracker)");
+  assert.doesNotMatch(finding?.evidence[0]?.snippet ?? "", /Record/);
+});
+
+test("supports var-initialized native maps and pointer sync.Map fields but rejects custom stores", async () => {
+  const source = cortexShape("getGoroutineID").replace(
+    "type requestTrackerHolder struct {\n  trackers sync.Map\n}",
+    `type requestTrackerHolder struct { trackers *sync.Map }
+type customStore struct{}
+func (*customStore) Store(any, any) {}
+type customHolder struct { trackers *customStore }
+func nativeState() {
+  var state = map[int64]string{}
+  state[getGoroutineID()] = "owned"
+}
+func customState(h *customHolder) { h.trackers.Store(getGoroutineID(), "diagnostic") }`,
+  );
+  const root = await repository({ "state.go": source });
+  const output = await review(root);
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.equal(finding?.evidence.length, 2);
+  assert.deepEqual(finding?.evidence.map((item) => item.snippet), [
+    'state[getGoroutineID()] = "owned"',
+    "h.trackers.Store(getGoroutineID(), tracker)",
+  ]);
+});
+
+test("suppresses only ID-specific terminating guards before key use", async () => {
+  const root = await repository({
+    "guards.go": `package sample
+
+import (
+  "runtime"
+  "strconv"
+  "strings"
+  "sync"
+)
+
+type holder struct { trackers sync.Map }
+func rawID() int64 {
+  var buf [64]byte
+  n := runtime.Stack(buf[:], false)
+  text := strings.TrimPrefix(string(buf[:n]), "goroutine ")
+  id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  return id
+}
+func panicID() int64 {
+  var buf [64]byte
+  n := runtime.Stack(buf[:], false)
+  text := strings.TrimPrefix(string(buf[:n]), "goroutine ")
+  id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  if id == 0 { panic("invalid goroutine id") }
+  return id
+}
+func retryID() int64 {
+  for {
+    var buf [64]byte
+    n := runtime.Stack(buf[:], false)
+    text := strings.TrimPrefix(string(buf[:n]), "goroutine ")
+    id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+    if id == 0 { continue }
+    return id
+  }
+}
+func (h *holder) SafeReturn(value any) {
+  id := rawID()
+  if id == 0 { return }
+  h.trackers.Store(id, value)
+}
+func (h *holder) SafePanic(value any) {
+  id := rawID()
+  if 0 == id { panic("invalid goroutine id") }
+  h.trackers.Store(id, value)
+}
+func (h *holder) SafeHelpers(value any) {
+  h.trackers.Store(panicID(), value)
+  h.trackers.Store(retryID(), value)
+}
+func (h *holder) Reassigned(value any) {
+  id := rawID()
+  id = 7
+  h.trackers.Store(id, value)
+}
+func (h *holder) UnrelatedGuard(other int64, value any) {
+  id := rawID()
+  if other == 0 { return }
+  _, _ = h.trackers.Load(id)
+}
+`,
+  });
+  const output = await review(root);
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.equal(finding?.evidence.length, 1);
+  assert.equal(finding?.evidence[0]?.snippet, "_, _ = h.trackers.Load(id)");
+});
+
+test("does not treat a shadowed panic call as terminating", async () => {
+  const source = cortexShape("rawID").replace(
+    "type requestTracker struct{}",
+    `type requestTracker struct{}
+func panic(any) {}`,
+  ).replace(
+    "func (h *requestTrackerHolder) Set(tracker *requestTracker) {\n  h.trackers.Store(rawID(), tracker)\n}",
+    `func (h *requestTrackerHolder) Set(tracker *requestTracker) {
+  id := rawID()
+  if id == 0 { panic("not terminating") }
+  h.trackers.Store(id, tracker)
+}`,
+  );
+  const root = await repository({ "panic-shadow.go": source });
+  const output = await review(root);
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.equal(finding?.evidence[0]?.snippet, "h.trackers.Store(id, tracker)");
+});
+
+test("an inner closure shadow does not hide a real outer package call", async () => {
+  const source = cortexShape("getGoroutineID").replace(
+    "var buf [64]byte",
+    `type fakeRuntime struct{}
+  _ = func(runtime fakeRuntime) { _ = runtime }
+  var buf [64]byte`,
+  );
+  const root = await repository({ "nested-shadow.go": source });
+  const output = await review(root);
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
 });
 
 test("anchors a changed goroutine-prefix contract instead of an unchanged key call", async () => {

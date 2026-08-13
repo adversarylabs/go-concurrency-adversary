@@ -90,8 +90,8 @@ Regression entry: graded fixtures and corpus under `test/`.
 | --- | --- |
 | **What** | Production mutable state is keyed by a goroutine identifier parsed from `runtime.Stack` text |
 | **Why** | Goroutine IDs are not a supported application ownership boundary; stack text is diagnostic output, and ignored parse failures can collapse independent operations onto key zero |
-| **Looks for** | A changed non-test Go path where one helper parses and returns the `goroutine <id>` prefix from `runtime.Stack(..., false)`, discards the conversion error, and directly supplies that helper result to a declared `sync.Map` or native map key operation |
-| **Stays quiet when** | Stack output is only logged or diagnosed; `all=true`; parsing fails closed; pprof/trace/debug affinity checks; tests; context, request IDs, or explicit handles own the state; the parsed value is not used as a mutable state key |
+| **Looks for** | A changed non-test Go path where one helper parses and returns the exact `goroutine <id>` prefix from `runtime.Stack(..., false)`, discards the conversion error, and supplies that helper result directly or through one local assignment to an exactly resolved `sync.Map` or native map key operation |
+| **Stays quiet when** | Stack output is only logged or diagnosed; `all=true`; parsing fails closed; an ID-specific guard provably terminates before key use; pprof/trace/debug affinity checks; tests; context, request IDs, or explicit handles own the state; the parsed value is not used as a mutable state key |
 | **Public grounding** | Go FAQ, “Why is there no goroutine ID?”; Cortex store-gateway review #7271 |
 | **Remediation** | Pass request-scoped state/context through the interface and use an explicit request handle; isolate a temporary compatibility shim and fail closed on parse errors |
 
