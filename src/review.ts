@@ -22,6 +22,7 @@ export async function reviewConcurrency(
   const timers = matching(analysis, "go-concurrency.timer.not-stopped");
   const atomicCapacity = matching(analysis, "go-concurrency.atomic-capacity-check-update");
   const goroutineIDStateKeys = matching(analysis, "go-concurrency.goroutine-id-state-key");
+  const prematureStateMarkers = matching(analysis, "go-concurrency.external-state-marker-before-success");
   const concurrentApiMissing = matching(analysis, "go-concurrency.concurrent-api.missing-test");
 
   emitGroupedFinding(ctx, deadlocks, {
@@ -155,6 +156,16 @@ export async function reviewConcurrency(
     recommendation: "Pass request-scoped state or context through the interface and key ownership with an explicit request handle. If an upstream callback temporarily prevents that, isolate and document the compatibility shim and fail closed when identity parsing fails.",
   });
 
+  emitGroupedFinding(ctx, prematureStateMarkers, {
+    title: "Failed external work is recorded as completed local state",
+    category: "correctness",
+    severity: "high",
+    summary: (count) => `${count} external mutation path${count === 1 ? "" : "s"} write the map entry that suppresses a retry even when the operation returns an error.`,
+    whyItMatters: "The same map entry is used as the later already-done check. Writing it after an error path falls through makes local ownership state disagree with the external system.",
+    impact: "The caller sees the first failure, but a retry skips the external operation and can return success while the resource is still absent.",
+    recommendation: "Return on the failed external operation, or write the local map entry only after success (including explicitly accepted already-exists outcomes).",
+  });
+
   emitGroupedFinding(ctx, concurrentApiMissing, {
     title: "Concurrent API guarantee lacks test for overlapping calls",
     category: "correctness",
@@ -181,6 +192,7 @@ export async function reviewConcurrency(
   if (tickers.length > 0) staticSeverities.push("medium");
   if (timers.length > 0) staticSeverities.push(timerSeverity(analysis.goVersion));
   if (atomicCapacity.length > 0) staticSeverities.push("high");
+  if (prematureStateMarkers.length > 0) staticSeverities.push("high");
   if (goroutineIDStateKeys.length > 0) staticSeverities.push("medium");
   if (concurrentApiMissing.length > 0) staticSeverities.push("medium");
   const staticPrimaryConcern =
@@ -191,6 +203,7 @@ export async function reviewConcurrency(
     waitGroupCopied.length > 0 ? "WaitGroup value copies" :
     loopVars.length > 0 ? "loop variable captures in goroutines" :
     atomicCapacity.length > 0 ? "non-atomic capacity admission" :
+    prematureStateMarkers.length > 0 ? "failed external work recorded as completed local state" :
     goroutineIDStateKeys.length > 0 ? "goroutine identifiers used as mutable state keys" :
     cancellation.length > 0 ? "discarded cancellation ownership" :
     detachedContexts.length > 0 ? "operations detached from caller cancellation" :
@@ -226,6 +239,7 @@ export async function reviewConcurrency(
     tickers,
     timers,
     atomicCapacity,
+    prematureStateMarkers,
     goroutineIDStateKeys,
     concurrentApiMissing,
     ...(analysis.goVersion === undefined ? {} : { goVersion: analysis.goVersion }),
@@ -325,6 +339,7 @@ function addAssessment(
     tickers: Signal[];
     timers: Signal[];
     atomicCapacity: Signal[];
+    prematureStateMarkers: Signal[];
     goroutineIDStateKeys: Signal[];
     concurrentApiMissing: Signal[];
     goVersion?: GoVersion;
@@ -404,6 +419,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would make capacity admission atomic before merging.",
+    });
+    return;
+  }
+  if (groups.prematureStateMarkers.length > 0) {
+    ctx.review.assessment({
+      risk: "high",
+      summary: "A failed external mutation still advances the local map state that suppresses future attempts, so retries can silently report success without repairing the external resource.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would make the local success marker conditional on external success before merging.",
     });
     return;
   }
