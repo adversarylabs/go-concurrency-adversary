@@ -27,6 +27,7 @@ Highlights:
 | Timers | `time.Ticker` / `Timer` not stopped |
 | Loops | Loop variable capture in goroutines |
 | Mutex | Mutex copied by value |
+| State identity | Mutable state keyed by goroutine IDs parsed from stack text |
 
 ### Ownership boundaries
 
