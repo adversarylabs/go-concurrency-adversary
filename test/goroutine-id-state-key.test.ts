@@ -485,6 +485,123 @@ test("requires changed semantic evidence and anchors a changed state-key call", 
   assert.equal(finding?.evidence[0]?.snippet, "h.trackers.Store(currentGoroutineID(), tracker)");
 });
 
+test("does not let a later zero guard hide an earlier conditional parsed-ID return", async () => {
+  const source = cortexShape("getGoroutineID").replace(
+    "id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)\n  return id",
+    `id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  if id > 10 { return id }
+  if id == 0 { panic("invalid goroutine id") }
+  return id`,
+  );
+  const output = await review(await repository({ "guard-dominance.go": source }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+});
+
+test("does not let a conditional post-parse overwrite hide the unmodified path", async () => {
+  const source = cortexShape("getGoroutineID").replace(
+    "id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)\n  return id",
+    `id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  if id < 0 { id = 7 }
+  return id`,
+  );
+  const output = await review(await repository({ "conditional-overwrite.go": source }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+});
+
+test("does not let a pre-reassignment zero guard prove a later zero key safe", async () => {
+  const source = cortexShape("getGoroutineID").replace(
+    "id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)\n  return id",
+    `id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  if id == 0 { panic("invalid goroutine id") }
+  if id > 10 { id = 0 }
+  return id`,
+  );
+  const output = await review(await repository({ "guard-before-reassignment.go": source }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+});
+
+test("resolves package mutable state declared after its use", async () => {
+  const source = cortexShape("getGoroutineID")
+    .replace("h.trackers.Store(getGoroutineID(), tracker)", "globalTrackers.Store(getGoroutineID(), tracker)")
+    .replace("func (h *requestTrackerHolder) Get()", "var globalTrackers sync.Map\n\nfunc (h *requestTrackerHolder) Get()");
+  const output = await review(await repository({ "late-global.go": source }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+});
+
+test("ignores shadows confined to sibling blocks", async () => {
+  const source = cortexShape("getGoroutineID")
+    .replace(
+      "h.trackers.Store(getGoroutineID(), tracker)",
+      `if false { getGoroutineID := func() int64 { return 7 }; _ = getGoroutineID }
+  h.trackers.Store(getGoroutineID(), tracker)`,
+    )
+    .replace(
+      "var buf [64]byte",
+      `if false { runtime := struct{}{}; _ = runtime }
+  var buf [64]byte`,
+    );
+  const output = await review(await repository({ "sibling-shadow.go": source }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+});
+
+test("ignores shadows confined to if initializers", async () => {
+  const source = cortexShape("getGoroutineID")
+    .replace(
+      "h.trackers.Store(getGoroutineID(), tracker)",
+      `if getGoroutineID := func() int64 { return 7 }; false { _ = getGoroutineID }
+  h.trackers.Store(getGoroutineID(), tracker)`,
+    )
+    .replace(
+      "var buf [64]byte",
+      `if runtime := struct{}{}; false { _ = runtime }
+  var buf [64]byte`,
+    );
+  const output = await review(await repository({ "if-init-shadow.go": source }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+});
+
+test("accepts canonical zero-based stack slices and rejects nonzero and full slices", async () => {
+  const canonical = cortexShape("getGoroutineID")
+    .replace("runtime.Stack(buf[:], false)", "runtime.Stack(buf[0:], false)")
+    .replace("string(buf[:n])", "string(buf[0:n])");
+  let output = await review(await repository({ "canonical.go": canonical }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+
+  const invalidInput = canonical.replace("buf[0:]", "buf[1:]");
+  const invalidWindow = canonical.replace("buf[0:n]", "buf[1:n]");
+  const invalidCapacity = canonical.replace("buf[0:n]", "buf[0:n:cap(buf)]");
+  for (const [path, source] of Object.entries({ invalidInput, invalidWindow, invalidCapacity })) {
+    output = await review(await repository({ [`${path}.go`]: source }));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), false, path);
+  }
+});
+
+test("supports simple same-file native map aliases", async () => {
+  const source = cortexShape("getGoroutineID").replace(
+    "type requestTracker struct{}",
+    `type requestTracker struct{}
+type baseTrackerMap map[int64]*requestTracker
+type trackerMap = baseTrackerMap
+var aliasedTrackers = trackerMap{}`,
+  ).replace(
+    "h.trackers.Store(getGoroutineID(), tracker)",
+    "aliasedTrackers[getGoroutineID()] = tracker",
+  );
+  const output = await review(await repository({ "map-alias.go": source }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+});
+
+test("ignores comment-only edits on a semantic anchor", async () => {
+  const before = cortexShape("getGoroutineID");
+  const root = await repository({ "tracking.go": before }, true);
+  await writeFile(join(root, "tracking.go"), before.replace(
+    "h.trackers.Store(getGoroutineID(), tracker)",
+    "h.trackers.Store(getGoroutineID(), tracker) // ownership cache",
+  ));
+  const output = await changedReview(root);
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
 async function review(root: string) {
   return createApp().run({ input: { source: { path: root } } });
 }
