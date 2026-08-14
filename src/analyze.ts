@@ -337,7 +337,15 @@ function guardTerminates(statement: Node, boundary: Node, source: string, allowR
   return consequence !== null && blockTerminates(consequence, boundary, source, allowReturn);
 }
 
+const pathContinues = 1;
+const pathTerminatesSafely = 2;
+const pathTerminatesUnsafely = 4;
+
 function blockTerminates(block: Node, boundary: Node, source: string, allowReturn: boolean): boolean {
+  return blockTerminationOutcomes(block, boundary, source, allowReturn) === pathTerminatesSafely;
+}
+
+function blockTerminationOutcomes(block: Node, boundary: Node, source: string, allowReturn: boolean): number {
   const statementList = block.type === "statement_list"
     ? block
     : block.namedChildren.find((node) => node.type === "statement_list");
@@ -345,47 +353,58 @@ function blockTerminates(block: Node, boundary: Node, source: string, allowRetur
     const nested = block.namedChildren.find((node) =>
       node.type === "block" || node.type === "if_statement" ||
       node.type === "expression_switch_statement" || node.type === "type_switch_statement");
-    return nested !== undefined && blockTerminates(nested, boundary, source, allowReturn);
+    return nested === undefined
+      ? pathContinues
+      : statementTerminationOutcomes(nested, boundary, source, allowReturn);
   }
-  const statements = statementList.namedChildren;
-  const final = statements.at(-1);
-  if (final === undefined) return false;
-  if (allowReturn && final?.type === "return_statement") return true;
-  if (final?.type === "continue_statement") return hasAncestorBefore(final, "for_statement", boundary);
-  if (final.type === "if_statement") {
-    const consequence = final.childForFieldName("consequence");
-    const alternative = final.childForFieldName("alternative");
-    return consequence !== null && alternative !== null &&
-      blockTerminates(consequence, boundary, source, allowReturn) &&
-      blockTerminates(alternative, boundary, source, allowReturn);
+  let outcomes = pathContinues;
+  for (const statement of statementList.namedChildren) {
+    if ((outcomes & pathContinues) === 0) break;
+    outcomes = (outcomes & ~pathContinues) |
+      statementTerminationOutcomes(statement, boundary, source, allowReturn);
   }
-  if (final.type === "expression_switch_statement" || final.type === "type_switch_statement") {
-    return exhaustiveSwitchTerminates(final, boundary, source, allowReturn);
+  return outcomes;
+}
+
+function statementTerminationOutcomes(statement: Node, boundary: Node, source: string, allowReturn: boolean): number {
+  if (statement.type === "return_statement") {
+    return allowReturn ? pathTerminatesSafely : pathTerminatesUnsafely;
   }
-  if (final?.type !== "expression_statement") return false;
-  const call = final.namedChildren[0];
+  if (statement.type === "continue_statement") {
+    return hasAncestorBefore(statement, "for_statement", boundary) ? pathTerminatesSafely : pathTerminatesUnsafely;
+  }
+  if (statement.type === "break_statement" || statement.type === "goto_statement" ||
+      statement.type === "fallthrough_statement") return pathTerminatesUnsafely;
+  if (statement.type === "if_statement") {
+    const consequence = statement.childForFieldName("consequence");
+    const alternative = statement.childForFieldName("alternative");
+    const consequenceOutcomes = consequence === null
+      ? pathContinues
+      : blockTerminationOutcomes(consequence, boundary, source, allowReturn);
+    const alternativeOutcomes = alternative === null
+      ? pathContinues
+      : blockTerminationOutcomes(alternative, boundary, source, allowReturn);
+    return consequenceOutcomes | alternativeOutcomes;
+  }
+  if (statement.type === "expression_switch_statement" || statement.type === "type_switch_statement") {
+    return switchTerminationOutcomes(statement, boundary, source, allowReturn);
+  }
+  if (statement.type === "block") return blockTerminationOutcomes(statement, boundary, source, allowReturn);
+  if (statement.type !== "expression_statement") return pathContinues;
+  const call = statement.namedChildren[0];
   const callee = call?.type === "call_expression" ? call.childForFieldName("function") : null;
   return callee?.type === "identifier" && sourceText(callee, source) === "panic" &&
-    isBuiltinPanic(call!, boundary, source);
+    isBuiltinPanic(call!, boundary, source) ? pathTerminatesSafely : pathContinues;
 }
 
-function exhaustiveSwitchTerminates(statement: Node, boundary: Node, source: string, allowReturn: boolean): boolean {
+function switchTerminationOutcomes(statement: Node, boundary: Node, source: string, allowReturn: boolean): number {
   const cases = statement.namedChildren.filter((node) =>
     node.type === "expression_case" || node.type === "type_case" || node.type === "default_case");
-  if (cases.length === 0 || !cases.some((node) => node.type === "default_case")) return false;
-  return cases.every((item, index) => {
-    let target = index;
-    while (caseFallsThrough(cases[target]!)) {
-      target += 1;
-      if (target >= cases.length) return false;
-    }
-    return blockTerminates(cases[target]!, boundary, source, allowReturn);
-  });
-}
-
-function caseFallsThrough(item: Node): boolean {
-  const statements = item.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
-  return statements.at(-1)?.type === "fallthrough_statement";
+  let outcomes = cases.some((node) => node.type === "default_case") ? 0 : pathContinues;
+  for (const item of cases) {
+    outcomes |= blockTerminationOutcomes(item, boundary, source, allowReturn);
+  }
+  return outcomes;
 }
 
 function isBuiltinPanic(call: Node, boundary: Node, source: string): boolean {

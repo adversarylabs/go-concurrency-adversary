@@ -677,6 +677,28 @@ test("requires recursive guards and exhaustive switches to terminate every zero 
   const unsafeSwitch = safeCaller.replace("default: return", "case &requestTracker{}: return");
   output = await review(await repository({ "switch-unsafe.go": unsafeSwitch }));
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+
+  const unreachableHelperPanic = cortexShape("goroutineID").replace(
+    "id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)\n  return id",
+    `id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  if id == 0 { return 0; panic("unreachable") }
+  return id`,
+  );
+  output = await review(await repository({ "unreachable-helper-panic.go": unreachableHelperPanic }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+
+  const unreachableCallerPanic = safeCaller.replace(
+    `switch tracker {
+    case nil: panic("nil tracker")
+    default: return
+    }`,
+    `switch tracker {
+    case nil: break; panic("unreachable")
+    default: return
+    }`,
+  );
+  output = await review(await repository({ "unreachable-caller-panic.go": unreachableCallerPanic }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
 });
 
 test("handles Go zero literal forms in slices and guards without treating identifiers as constants", async () => {
