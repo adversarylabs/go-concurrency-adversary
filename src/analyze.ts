@@ -259,7 +259,7 @@ function isStackString(node: Node, fnBoundary: Node, source: string, buffer: str
 }
 
 function isZeroOrOmitted(node: Node | null): boolean {
-  return node === null || (node.type === "int_literal" && node.text === "0");
+  return node === null || (node.type === "int_literal" && parseGoInteger(node.text) === 0);
 }
 
 function isGoroutinePrefixLiteral(node: Node, source: string): boolean {
@@ -334,16 +334,58 @@ function hasTerminatingKeyGuard(
 
 function guardTerminates(statement: Node, boundary: Node, source: string, allowReturn: boolean): boolean {
   const consequence = statement.childForFieldName("consequence");
-  if (consequence === null) return false;
-  const statements = consequence.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
+  return consequence !== null && blockTerminates(consequence, boundary, source, allowReturn);
+}
+
+function blockTerminates(block: Node, boundary: Node, source: string, allowReturn: boolean): boolean {
+  const statementList = block.type === "statement_list"
+    ? block
+    : block.namedChildren.find((node) => node.type === "statement_list");
+  if (statementList === undefined) {
+    const nested = block.namedChildren.find((node) =>
+      node.type === "block" || node.type === "if_statement" ||
+      node.type === "expression_switch_statement" || node.type === "type_switch_statement");
+    return nested !== undefined && blockTerminates(nested, boundary, source, allowReturn);
+  }
+  const statements = statementList.namedChildren;
   const final = statements.at(-1);
+  if (final === undefined) return false;
   if (allowReturn && final?.type === "return_statement") return true;
   if (final?.type === "continue_statement") return hasAncestorBefore(final, "for_statement", boundary);
+  if (final.type === "if_statement") {
+    const consequence = final.childForFieldName("consequence");
+    const alternative = final.childForFieldName("alternative");
+    return consequence !== null && alternative !== null &&
+      blockTerminates(consequence, boundary, source, allowReturn) &&
+      blockTerminates(alternative, boundary, source, allowReturn);
+  }
+  if (final.type === "expression_switch_statement" || final.type === "type_switch_statement") {
+    return exhaustiveSwitchTerminates(final, boundary, source, allowReturn);
+  }
   if (final?.type !== "expression_statement") return false;
   const call = final.namedChildren[0];
   const callee = call?.type === "call_expression" ? call.childForFieldName("function") : null;
   return callee?.type === "identifier" && sourceText(callee, source) === "panic" &&
     isBuiltinPanic(call!, boundary, source);
+}
+
+function exhaustiveSwitchTerminates(statement: Node, boundary: Node, source: string, allowReturn: boolean): boolean {
+  const cases = statement.namedChildren.filter((node) =>
+    node.type === "expression_case" || node.type === "type_case" || node.type === "default_case");
+  if (cases.length === 0 || !cases.some((node) => node.type === "default_case")) return false;
+  return cases.every((item, index) => {
+    let target = index;
+    while (caseFallsThrough(cases[target]!)) {
+      target += 1;
+      if (target >= cases.length) return false;
+    }
+    return blockTerminates(cases[target]!, boundary, source, allowReturn);
+  });
+}
+
+function caseFallsThrough(item: Node): boolean {
+  const statements = item.namedChildren.find((node) => node.type === "statement_list")?.namedChildren ?? [];
+  return statements.at(-1)?.type === "fallthrough_statement";
 }
 
 function isBuiltinPanic(call: Node, boundary: Node, source: string): boolean {
@@ -360,7 +402,22 @@ function isBuiltinPanic(call: Node, boundary: Node, source: string): boolean {
 function isParsedIDZeroCondition(condition: Node, parsedID: string, source: string): boolean {
   const compact = sourceText(condition, source).replace(/\s+/g, "").replace(/^\((.*)\)$/, "$1");
   const id = escapeRegExp(parsedID);
-  return new RegExp(`^(?:${id}(?:==|<=)0|0==${id})$`).test(compact);
+  const after = compact.match(new RegExp(`^${id}(==|<=)(.+)$`));
+  if (after !== null) return parseGoInteger(after[2]!) === 0;
+  const before = compact.match(new RegExp(`^(.+)==${id}$`));
+  return before !== null && parseGoInteger(before[1]!) === 0;
+}
+
+function parseGoInteger(literal: string): number | undefined {
+  const text = literal.replaceAll("_", "");
+  let value: number;
+  if (/^0[bB][01]+$/.test(text)) value = Number.parseInt(text.slice(2), 2);
+  else if (/^0[oO][0-7]+$/.test(text)) value = Number.parseInt(text.slice(2), 8);
+  else if (/^0[xX][0-9a-fA-F]+$/.test(text)) value = Number.parseInt(text.slice(2), 16);
+  else if (/^0[0-7]+$/.test(text) && text.length > 1) value = Number.parseInt(text.slice(1), 8);
+  else if (/^(?:0|[1-9]\d*)$/.test(text)) value = Number.parseInt(text, 10);
+  else return undefined;
+  return Number.isSafeInteger(value) ? value : undefined;
 }
 
 function hasAncestorBefore(node: Node, type: string, boundary: Node): boolean {
@@ -439,10 +496,19 @@ function assignmentPreservesNonzeroID(assignment: Node, name: string, source: st
   const offset = left.findIndex((node) => node.type === "identifier" && sourceText(node, source) === name);
   const value = right.length === left.length ? right[offset] : right[0];
   if (value === undefined) return false;
-  if (containsIdentifier(value, source, name)) return true;
-  if (value.type !== "int_literal") return false;
-  const digits = sourceText(value, source).replace(/_/g, "").replace(/^0[xob]/i, "");
-  return !/^0+$/.test(digits);
+  if (isExactIdentifierValue(value, name, source)) return true;
+  return value.type === "int_literal" && (parseGoInteger(sourceText(value, source)) ?? 0) !== 0;
+}
+
+function isExactIdentifierValue(node: Node, name: string, source: string): boolean {
+  if (node.type === "identifier") return sourceText(node, source) === name;
+  if (node.type === "parenthesized_expression" && node.namedChildren.length === 1) {
+    return isExactIdentifierValue(node.namedChildren[0]!, name, source);
+  }
+  if (node.type === "unary_expression" && sourceText(node, source).trim().startsWith("+") && node.namedChildren.length === 1) {
+    return isExactIdentifierValue(node.namedChildren[0]!, name, source);
+  }
+  return false;
 }
 
 function isLocallyShadowedAt(fn: Node, reference: Node, source: string, name: string): boolean {
@@ -453,17 +519,31 @@ function isLocallyShadowedAt(fn: Node, reference: Node, source: string, name: st
       ...functionDescendants(fn, body, "short_var_declaration"),
       ...functionDescendants(fn, body, "var_spec"),
       ...functionDescendants(fn, body, "range_clause"),
+      ...functionDescendants(fn, body, "receive_statement"),
+      ...functionDescendants(fn, body, "type_switch_statement"),
     ]),
   ];
   for (const declaration of declarations) {
     if (declaration.startIndex >= reference.startIndex ||
         (!callableParameterDeclarations(fn).some((parameter) => parameter.id === declaration.id) &&
           !declarationVisibleAt(declaration, reference))) continue;
-    const left = declaration.childForFieldName("left")?.namedChildren ?? [];
-    const named = left.length > 0 ? left : declaration.namedChildren;
-    if (named.some((node) => node.type === "identifier" && sourceText(node, source) === name)) return true;
+    if (controlBindingNames(declaration, source).includes(name)) return true;
   }
   return false;
+}
+
+function controlBindingNames(declaration: Node, source: string): string[] {
+  if (declaration.type === "parameter_declaration" || declaration.type === "var_spec") {
+    return directDeclaredNames(declaration, source);
+  }
+  if ((declaration.type === "range_clause" || declaration.type === "receive_statement") &&
+      !sourceText(declaration, source).includes(":=")) return [];
+  const field = declaration.type === "type_switch_statement" ? "alias" : "left";
+  const selected = declaration.childForFieldName(field)?.namedChildren ?? [];
+  const named = selected.length > 0 ? selected : declaration.namedChildren;
+  return named
+    .filter((node) => node.type === "identifier" || node.type === "field_identifier")
+    .map((node) => sourceText(node, source));
 }
 
 function escapeRegExp(value: string): string {
@@ -561,6 +641,9 @@ function resolveIdentifierBinding(name: string, use: Node, index: MutableStateIn
       const locals = [
         ...functionDescendants(callable, body, "var_spec"),
         ...functionDescendants(callable, body, "short_var_declaration"),
+        ...functionDescendants(callable, body, "range_clause"),
+        ...functionDescendants(callable, body, "receive_statement"),
+        ...functionDescendants(callable, body, "type_switch_statement"),
       ].filter((declaration) => declaration.startIndex < use.startIndex && declarationVisibleAt(declaration, use))
         .flatMap((declaration) => {
           const binding = bindingFromDeclaration(declaration, name, index);
@@ -604,6 +687,10 @@ function bindingFromDeclaration(declaration: Node, name: string, index: MutableS
     if (offset < 0) return undefined;
     const value = right.length === left.length ? right[offset] : right[0];
     return value === undefined ? { mutable: false } : bindingFromValue(value, index);
+  }
+  if (declaration.type === "range_clause" || declaration.type === "receive_statement" ||
+      declaration.type === "type_switch_statement") {
+    return controlBindingNames(declaration, index.source).includes(name) ? { mutable: false } : undefined;
   }
   return undefined;
 }
@@ -664,8 +751,10 @@ function isMutableStateType(type: string, syncAlias: string | undefined, mapAlia
 
 function isMutableStateInitializer(value: string, syncAlias: string | undefined, mapAliases: Set<string>): boolean {
   const initialized = initializedNamedType(value);
+  const made = /^make\s*\(\s*([A-Za-z_]\w*)\s*(?:,|\))/.exec(value)?.[1];
   return /^make\s*\(\s*map\s*\[/.test(value) ||
     /^map\s*\[.*\]\s*.*\{/.test(value) ||
+    (made !== undefined && mapAliases.has(made)) ||
     (initialized !== undefined && mapAliases.has(initialized)) ||
     (syncAlias !== undefined && new RegExp(`^&?${syncAlias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.Map\\s*\\{`).test(value));
 }

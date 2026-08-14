@@ -591,6 +591,155 @@ var aliasedTrackers = trackerMap{}`,
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
 });
 
+test("only carries nonzero proof through identity-preserving assignments", async () => {
+  for (const expression of ["id - id", "id % id"]) {
+    const source = cortexShape("goroutineID").replace(
+      "id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)\n  return id",
+      `id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  if id == 0 { panic("invalid goroutine id") }
+  id = ${expression}
+  return id`,
+    );
+    const output = await review(await repository({ "unsafe-transform.go": source }));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), true, expression);
+  }
+
+  for (const expression of ["id", "+id", "+(id)"]) {
+    const source = cortexShape("goroutineID").replace(
+      "id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)\n  return id",
+      `id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  if id == 0 { panic("invalid goroutine id") }
+  id = ${expression}
+  return id`,
+    );
+    const output = await review(await repository({ "safe-transform.go": source }));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), false, expression);
+  }
+});
+
+test("requires recursive guards and exhaustive switches to terminate every zero path", async () => {
+  const safeHelper = cortexShape("goroutineID").replace(
+    "id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)\n  return id",
+    `id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  if id == 0 {
+    if len(text) > 1 { panic("invalid goroutine id") } else { panic("empty goroutine id") }
+  }
+  return id`,
+  );
+  let output = await review(await repository({ "nested-safe.go": safeHelper }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+
+  const switchHelper = cortexShape("goroutineID").replace(
+    "id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)\n  return id",
+    `id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  if id == 0 {
+    switch len(text) {
+    case 0: panic("empty goroutine id")
+    default: panic("invalid goroutine id")
+    }
+  }
+  return id`,
+  );
+  output = await review(await repository({ "switch-helper-safe.go": switchHelper }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+
+  const safeCaller = cortexShape("goroutineID")
+    .replace("h.trackers.Load(goroutineID())", "h.trackers.Load(1)")
+    .replace("h.trackers.Delete(goroutineID())", "h.trackers.Delete(1)")
+    .replace("h.trackers.Store(goroutineID(), tracker)", `id := goroutineID()
+  if id == 0 {
+    switch tracker {
+    case nil: panic("nil tracker")
+    default: return
+    }
+  }
+  h.trackers.Store(id, tracker)`);
+  output = await review(await repository({ "switch-safe.go": safeCaller }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+
+  const nestedCaller = safeCaller.replace(
+    `switch tracker {
+    case nil: panic("nil tracker")
+    default: return
+    }`,
+    `if tracker == nil { panic("nil tracker") } else { return }`,
+  );
+  output = await review(await repository({ "nested-caller-safe.go": nestedCaller }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+
+  const unsafe = safeHelper.replace(
+    `if len(text) > 1 { panic("invalid goroutine id") } else { panic("empty goroutine id") }`,
+    `if len(text) > 1 { panic("invalid goroutine id") }`,
+  );
+  output = await review(await repository({ "nested-unsafe.go": unsafe }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+
+  const unsafeSwitch = safeCaller.replace("default: return", "case &requestTracker{}: return");
+  output = await review(await repository({ "switch-unsafe.go": unsafeSwitch }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+});
+
+test("handles Go zero literal forms in slices and guards without treating identifiers as constants", async () => {
+  for (const zero of ["0", "00", "0_0", "0x0", "0x_0", "0b0", "0b_0", "0o0", "0o_0"]) {
+    const source = cortexShape("goroutineID")
+      .replace("runtime.Stack(buf[:], false)", `runtime.Stack(buf[${zero}:], false)`)
+      .replace("string(buf[:n])", `string(buf[${zero}:n])`)
+      .replace("id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)\n  return id",
+        `id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  if id == ${zero} { panic("invalid goroutine id") }
+  return id`);
+    const output = await review(await repository({ "zero-literal.go": source }));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), false, zero);
+  }
+
+  const identifierGuard = cortexShape("goroutineID").replace(
+    "id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)\n  return id",
+    `id, _ := strconv.ParseInt(strings.Fields(text)[0], 10, 64)
+  const zero = 0
+  if id == zero { panic("invalid goroutine id") }
+  return id`,
+  );
+  const output = await review(await repository({ "identifier-zero.go": identifierGuard }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+});
+
+test("keeps select, range, and type-switch bindings lexical for packages and mutable state", async () => {
+  const source = cortexShape("realID")
+    .replace("type requestTracker struct{}", `type requestTracker struct{}
+type fakeRuntime struct{}
+func (fakeRuntime) Stack([]byte, bool) int { return 1 }
+type inertStore struct{}
+func (inertStore) Store(any, any) {}`)
+    .replace(
+      "h.trackers.Store(realID(), tracker)",
+      `runtimeCh := make(chan fakeRuntime)
+  select { case runtime := <-runtimeCh:
+    var buf [64]byte
+    _ = runtime.Stack(buf[:], false)
+  default:
+  }
+  stores := []inertStore{{}}
+  for _, trackers := range stores { trackers.Store(realID(), tracker) }
+  var candidate any = inertStore{}
+  switch trackers := candidate.(type) { case inertStore: trackers.Store(realID(), tracker) }
+  h.trackers.Store(realID(), tracker)`,
+    );
+  const output = await review(await repository({ "control-bindings.go": source }));
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.equal(finding?.evidence.length, 1);
+  assert.equal(finding?.evidence[0]?.snippet, "h.trackers.Store(realID(), tracker)");
+});
+
+test("recognizes make of a same-file named native map type", async () => {
+  const source = cortexShape("goroutineID")
+    .replace("type requestTracker struct{}", `type requestTracker struct{}
+type trackerMap map[int64]*requestTracker
+var namedTrackers = make(trackerMap)`)
+    .replace("h.trackers.Store(goroutineID(), tracker)", "namedTrackers[goroutineID()] = tracker");
+  const output = await review(await repository({ "made-map-alias.go": source }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+});
+
 test("ignores comment-only edits on a semantic anchor", async () => {
   const before = cortexShape("getGoroutineID");
   const root = await repository({ "tracking.go": before }, true);
