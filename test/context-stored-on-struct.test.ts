@@ -55,7 +55,8 @@ type Holder struct {
 
 import "context"
 
-type requestCtx = context.Context
+type baseCtx = context.Context
+type requestCtx = baseCtx
 
 type Manager struct {
 	owned requestCtx
@@ -145,10 +146,10 @@ type request struct {
 }
 
 type Server struct {
-	inFlight request
+	inFlight []request
 }
 
-var leftover request
+var leftover = request{}
 `,
   }));
   const findings = output.findings.filter((item) => item.ruleId === ruleId);
@@ -202,6 +203,29 @@ func (c *Client) Fetch() error { return nil }
     .replace("addr string", "addr string // default dial target"));
   const unrelated = await changedReview(root);
   assert.equal(unrelated.findings.some((item) => item.ruleId === ruleId), false);
+});
+
+test("diff locality reports an existing field whose alias becomes context.Context", async () => {
+  const safe = `package sample
+
+import "time"
+
+type base = time.Time
+type stored = base
+
+type Client struct {
+	ctx stored
+}
+`;
+  const bad = safe
+    .replace('import "time"', 'import "context"')
+    .replace("time.Time", "context.Context");
+  const root = await repository({ "client.go": safe }, true);
+  await writeFile(join(root, "client.go"), bad);
+  const output = await changedReview(root);
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.ok(finding, JSON.stringify(output.findings, null, 2));
+  assert.equal(finding.evidence[0]?.location?.line, 5);
 });
 
 async function review(root: string) {

@@ -1674,13 +1674,17 @@ function analyzeStoredContextFields(
   signals: Signal[],
 ): void {
   if (file.path.endsWith("_test.go")) return;
-  const contextNames = contextTypeNames(root, file.current, aliases);
-  if (contextNames.size === 0) return;
-  for (const fact of collectStoredContextFields(root, file.current, contextNames)) {
+  const contextTypes = contextTypeNames(root, file.current, aliases);
+  if (contextTypes.size === 0) return;
+  for (const fact of collectStoredContextFields(root, file.current, new Set(contextTypes.keys()))) {
     if (isShortLivedRequestOptionsType(fact.typeName, root, file.current)) continue;
+    const normalizedType = normalizeGoType(fact.typeText);
+    const typeEvidence = contextTypes.get(normalizedType) ?? [];
+    const anchor = [fact.field, ...typeEvidence].find((node) =>
+      isChangedEvidence(file, node.startPosition.row + 1, node.endPosition.row + 1)) ?? fact.field;
     signals.push(signal(
       file,
-      fact.field,
+      anchor,
       "go-concurrency.context.stored-on-struct",
       `${fact.typeName} stores ${fact.typeText} on field ${fact.fieldName}; pass context as the first parameter of each method that needs it.`,
       {
@@ -1692,10 +1696,14 @@ function analyzeStoredContextFields(
   }
 }
 
-function contextTypeNames(root: Node, source: string, aliases: Map<string, string>): Set<string> {
-  const names = new Set<string>();
+function contextTypeNames(root: Node, source: string, aliases: Map<string, string>): Map<string, Node[]> {
+  const names = new Map<string, Node[]>();
   const imported = aliases.get("context");
-  if (imported !== undefined) names.add(`${imported}.Context`);
+  if (imported !== undefined) {
+    const importSpec = descendants(root, "import_spec").find((spec) =>
+      /["`]context["`]$/.test(sourceText(spec, source).trim()));
+    if (importSpec !== undefined) names.set(`${imported}.Context`, [importSpec]);
+  }
   const specs = [...descendants(root, "type_spec"), ...descendants(root, "type_alias")];
   let discovered = true;
   while (discovered) {
@@ -1708,7 +1716,7 @@ function contextTypeNames(root: Node, source: string, aliases: Map<string, strin
       if (names.has(typeName)) continue;
       const normalized = normalizeGoType(sourceText(type, source));
       if (names.has(normalized)) {
-        names.add(typeName);
+        names.set(typeName, [spec, ...names.get(normalized)!]);
         discovered = true;
       }
     }
@@ -1775,15 +1783,22 @@ function isShortLivedRequestOptionsType(typeName: string, root: Node, source: st
       if (nearestAncestor(field, "struct_type")?.id !== type.id) continue;
       const fieldType = field.childForFieldName("type");
       if (fieldType === null) continue;
-      if (normalizeGoType(sourceText(fieldType, source)) === typeName) return false;
+      if (typeMentionsNamedType(sourceText(fieldType, source), typeName)) return false;
     }
   }
   for (const spec of descendants(root, "var_spec")) {
     if (findEnclosingFunction(spec) !== null) continue;
     const type = spec.childForFieldName("type");
     if (type !== null && normalizeGoType(sourceText(type, source)) === typeName) return false;
+    const value = spec.childForFieldName("value");
+    if (value !== null && initializedNamedType(sourceText(value, source)) === typeName) return false;
   }
   return true;
+}
+
+function typeMentionsNamedType(typeText: string, typeName: string): boolean {
+  const normalized = typeText.replace(/\s+/g, "");
+  return new RegExp(`(^|[^A-Za-z0-9_])${escapeRegExp(typeName)}($|[^A-Za-z0-9_])`).test(normalized);
 }
 
 function analyzeContextDetachment(

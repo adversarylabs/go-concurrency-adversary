@@ -3655,12 +3655,7 @@ var require_fast_uri = __commonJS({
     }
     function resolve3(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
-      const { parsed: baseParsed, malformedAuthorityOrPort: baseMalformed } = parseWithStatus(baseURI, schemelessOptions);
-      const { parsed: relativeParsed, malformedAuthorityOrPort: relativeMalformed } = parseWithStatus(relativeURI, schemelessOptions);
-      if (baseMalformed || relativeMalformed) {
-        throw new Error(baseParsed.error || relativeParsed.error || "URI is malformed.");
-      }
-      const resolved = resolveComponent(baseParsed, relativeParsed, schemelessOptions, true);
+      const resolved = resolveComponent(parse(baseURI, schemelessOptions), parse(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
@@ -3786,7 +3781,6 @@ var require_fast_uri = __commonJS({
     }
     var URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u;
     var AUTHORITY_PREFIX = /^(?:[^#/:?]+:)?\/\/([^/?#]*)/;
-    var AUTHORITY_INTRODUCER_REGION = /^(?:[^#/:?]+:)?([/\\\t\n\r]*)/;
     function getParseError(parsed, matches) {
       if (matches[2] !== void 0 && parsed.path && parsed.path[0] !== "/") {
         return 'URI path must start with "/" when authority is present.';
@@ -3820,20 +3814,6 @@ var require_fast_uri = __commonJS({
       if (authorityMatch !== null && authorityMatch[1].indexOf("\\") !== -1) {
         parsed.error = "URI authority must not contain a literal backslash.";
         malformedAuthorityOrPort = true;
-      }
-      const introducerMatch = uri.match(AUTHORITY_INTRODUCER_REGION);
-      if (introducerMatch !== null) {
-        const region = introducerMatch[1];
-        const normalizedRegion = region.replace(/[\t\n\r]/g, "");
-        if (normalizedRegion.length >= 2) {
-          if (normalizedRegion.slice(0, 2) !== "//") {
-            parsed.error = parsed.error || "URI authority must not contain a literal backslash.";
-            malformedAuthorityOrPort = true;
-          } else if (region.length !== normalizedRegion.length) {
-            parsed.error = parsed.error || "URI authority introducer must not contain whitespace.";
-            malformedAuthorityOrPort = true;
-          }
-        }
       }
       const matches = uri.match(URI_PARSE);
       if (matches) {
@@ -22465,13 +22445,16 @@ function helperCall(call, source, helpers) {
 }
 function analyzeStoredContextFields(file, root, aliases, signals) {
   if (file.path.endsWith("_test.go")) return;
-  const contextNames = contextTypeNames(root, file.current, aliases);
-  if (contextNames.size === 0) return;
-  for (const fact of collectStoredContextFields(root, file.current, contextNames)) {
+  const contextTypes = contextTypeNames(root, file.current, aliases);
+  if (contextTypes.size === 0) return;
+  for (const fact of collectStoredContextFields(root, file.current, new Set(contextTypes.keys()))) {
     if (isShortLivedRequestOptionsType(fact.typeName, root, file.current)) continue;
+    const normalizedType = normalizeGoType(fact.typeText);
+    const typeEvidence = contextTypes.get(normalizedType) ?? [];
+    const anchor = [fact.field, ...typeEvidence].find((node) => isChangedEvidence(file, node.startPosition.row + 1, node.endPosition.row + 1)) ?? fact.field;
     signals.push(signal(
       file,
-      fact.field,
+      anchor,
       "go-concurrency.context.stored-on-struct",
       `${fact.typeName} stores ${fact.typeText} on field ${fact.fieldName}; pass context as the first parameter of each method that needs it.`,
       {
@@ -22483,9 +22466,12 @@ function analyzeStoredContextFields(file, root, aliases, signals) {
   }
 }
 function contextTypeNames(root, source, aliases) {
-  const names = /* @__PURE__ */ new Set();
+  const names = /* @__PURE__ */ new Map();
   const imported = aliases.get("context");
-  if (imported !== void 0) names.add(`${imported}.Context`);
+  if (imported !== void 0) {
+    const importSpec = descendants(root, "import_spec").find((spec) => /["`]context["`]$/.test(sourceText(spec, source).trim()));
+    if (importSpec !== void 0) names.set(`${imported}.Context`, [importSpec]);
+  }
   const specs = [...descendants(root, "type_spec"), ...descendants(root, "type_alias")];
   let discovered = true;
   while (discovered) {
@@ -22498,7 +22484,7 @@ function contextTypeNames(root, source, aliases) {
       if (names.has(typeName)) continue;
       const normalized = normalizeGoType(sourceText(type, source));
       if (names.has(normalized)) {
-        names.add(typeName);
+        names.set(typeName, [spec, ...names.get(normalized)]);
         discovered = true;
       }
     }
@@ -22549,15 +22535,21 @@ function isShortLivedRequestOptionsType(typeName, root, source) {
       if (nearestAncestor(field, "struct_type")?.id !== type.id) continue;
       const fieldType = field.childForFieldName("type");
       if (fieldType === null) continue;
-      if (normalizeGoType(sourceText(fieldType, source)) === typeName) return false;
+      if (typeMentionsNamedType(sourceText(fieldType, source), typeName)) return false;
     }
   }
   for (const spec of descendants(root, "var_spec")) {
     if (findEnclosingFunction(spec) !== null) continue;
     const type = spec.childForFieldName("type");
     if (type !== null && normalizeGoType(sourceText(type, source)) === typeName) return false;
+    const value = spec.childForFieldName("value");
+    if (value !== null && initializedNamedType(sourceText(value, source)) === typeName) return false;
   }
   return true;
+}
+function typeMentionsNamedType(typeText, typeName) {
+  const normalized = typeText.replace(/\s+/g, "");
+  return new RegExp(`(^|[^A-Za-z0-9_])${escapeRegExp(typeName)}($|[^A-Za-z0-9_])`).test(normalized);
 }
 function analyzeContextDetachment(file, root, aliases, signals) {
   const contextAlias = aliases.get("context");
