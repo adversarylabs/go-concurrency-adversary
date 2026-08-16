@@ -139,10 +139,18 @@ function collectPrematureStateMarkers(root: Node, source: string): PrematureStat
         if (consequence === null) continue;
         const failure = fallthroughExternalFailure(fn, consequence, source, lookup.state);
         if (failure === undefined) continue;
-        const marker = statements.slice(index + 1)
-          .map((statement) => sameMapEntryWrite(statement, source, lookup.state, lookup.key))
-          .find((node): node is Node => node !== undefined);
+        let marker: Node | undefined;
+        let markerIndex = -1;
+        for (let candidate = index + 1; candidate < statements.length; candidate += 1) {
+          marker = sameMapEntryWrite(statements[candidate]!, source, lookup.state, lookup.key);
+          if (marker !== undefined) {
+            markerIndex = candidate;
+            break;
+          }
+        }
         if (marker === undefined) continue;
+        if (failureHandledBeforeMarker(
+          statements.slice(index + 1, markerIndex), failure.failureStatements, fn, source)) continue;
         const evidence = [
           marker,
           failure.call,
@@ -175,6 +183,38 @@ function collectPrematureStateMarkers(root: Node, source: string): PrematureStat
     }
   }
   return facts;
+}
+
+function failureHandledBeforeMarker(
+  statements: Node[],
+  failureStatements: Node[],
+  fn: Node,
+  source: string,
+): boolean {
+  if (statements.some((statement) => statement.type === "return_statement")) return true;
+  const assigned = new Set<string>();
+  for (const statement of failureStatements) {
+    for (const assignment of descendants(statement, "assignment_statement")) {
+      for (const left of assignment.childForFieldName("left")?.namedChildren ?? []) {
+        if (left.type === "identifier") assigned.add(sourceText(left, source));
+      }
+    }
+    if (statement.type === "assignment_statement") {
+      for (const left of statement.childForFieldName("left")?.namedChildren ?? []) {
+        if (left.type === "identifier") assigned.add(sourceText(left, source));
+      }
+    }
+  }
+  if (assigned.size === 0) return false;
+  return statements.some((statement) => {
+    if (statement.type !== "if_statement") return false;
+    const condition = statement.childForFieldName("condition");
+    const consequence = statement.childForFieldName("consequence");
+    if (condition === null || consequence === null || !blockTerminates(consequence, fn, source, true)) return false;
+    const conditionText = semanticText(sourceText(condition, source));
+    return [...assigned].some((name) =>
+      new RegExp(`(?:^|[(&|])${escapeRegExp(name)}!=nil(?:$|[)&|])`).test(conditionText));
+  });
 }
 
 function absentMapLookup(

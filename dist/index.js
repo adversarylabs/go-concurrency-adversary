@@ -3655,12 +3655,7 @@ var require_fast_uri = __commonJS({
     }
     function resolve3(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
-      const { parsed: baseParsed, malformedAuthorityOrPort: baseMalformed } = parseWithStatus(baseURI, schemelessOptions);
-      const { parsed: relativeParsed, malformedAuthorityOrPort: relativeMalformed } = parseWithStatus(relativeURI, schemelessOptions);
-      if (baseMalformed || relativeMalformed) {
-        throw new Error(baseParsed.error || relativeParsed.error || "URI is malformed.");
-      }
-      const resolved = resolveComponent(baseParsed, relativeParsed, schemelessOptions, true);
+      const resolved = resolveComponent(parse(baseURI, schemelessOptions), parse(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
@@ -3786,7 +3781,6 @@ var require_fast_uri = __commonJS({
     }
     var URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u;
     var AUTHORITY_PREFIX = /^(?:[^#/:?]+:)?\/\/([^/?#]*)/;
-    var AUTHORITY_INTRODUCER_REGION = /^(?:[^#/:?]+:)?([/\\\t\n\r]*)/;
     function getParseError(parsed, matches) {
       if (matches[2] !== void 0 && parsed.path && parsed.path[0] !== "/") {
         return 'URI path must start with "/" when authority is present.';
@@ -3820,20 +3814,6 @@ var require_fast_uri = __commonJS({
       if (authorityMatch !== null && authorityMatch[1].indexOf("\\") !== -1) {
         parsed.error = "URI authority must not contain a literal backslash.";
         malformedAuthorityOrPort = true;
-      }
-      const introducerMatch = uri.match(AUTHORITY_INTRODUCER_REGION);
-      if (introducerMatch !== null) {
-        const region = introducerMatch[1];
-        const normalizedRegion = region.replace(/[\t\n\r]/g, "");
-        if (normalizedRegion.length >= 2) {
-          if (normalizedRegion.slice(0, 2) !== "//") {
-            parsed.error = parsed.error || "URI authority must not contain a literal backslash.";
-            malformedAuthorityOrPort = true;
-          } else if (region.length !== normalizedRegion.length) {
-            parsed.error = parsed.error || "URI authority introducer must not contain whitespace.";
-            malformedAuthorityOrPort = true;
-          }
-        }
       }
       const matches = uri.match(URI_PARSE);
       if (matches) {
@@ -21234,8 +21214,22 @@ function collectPrematureStateMarkers(root, source) {
         if (consequence === null) continue;
         const failure = fallthroughExternalFailure(fn, consequence, source, lookup.state);
         if (failure === void 0) continue;
-        const marker = statements.slice(index + 1).map((statement) => sameMapEntryWrite(statement, source, lookup.state, lookup.key)).find((node) => node !== void 0);
+        let marker;
+        let markerIndex = -1;
+        for (let candidate = index + 1; candidate < statements.length; candidate += 1) {
+          marker = sameMapEntryWrite(statements[candidate], source, lookup.state, lookup.key);
+          if (marker !== void 0) {
+            markerIndex = candidate;
+            break;
+          }
+        }
         if (marker === void 0) continue;
+        if (failureHandledBeforeMarker(
+          statements.slice(index + 1, markerIndex),
+          failure.failureStatements,
+          fn,
+          source
+        )) continue;
         const evidence = [
           marker,
           failure.call,
@@ -21268,6 +21262,31 @@ function collectPrematureStateMarkers(root, source) {
     }
   }
   return facts;
+}
+function failureHandledBeforeMarker(statements, failureStatements, fn, source) {
+  if (statements.some((statement) => statement.type === "return_statement")) return true;
+  const assigned = /* @__PURE__ */ new Set();
+  for (const statement of failureStatements) {
+    for (const assignment of descendants(statement, "assignment_statement")) {
+      for (const left of assignment.childForFieldName("left")?.namedChildren ?? []) {
+        if (left.type === "identifier") assigned.add(sourceText(left, source));
+      }
+    }
+    if (statement.type === "assignment_statement") {
+      for (const left of statement.childForFieldName("left")?.namedChildren ?? []) {
+        if (left.type === "identifier") assigned.add(sourceText(left, source));
+      }
+    }
+  }
+  if (assigned.size === 0) return false;
+  return statements.some((statement) => {
+    if (statement.type !== "if_statement") return false;
+    const condition = statement.childForFieldName("condition");
+    const consequence = statement.childForFieldName("consequence");
+    if (condition === null || consequence === null || !blockTerminates(consequence, fn, source, true)) return false;
+    const conditionText = semanticText(sourceText(condition, source));
+    return [...assigned].some((name2) => new RegExp(`(?:^|[(&|])${escapeRegExp(name2)}!=nil(?:$|[)&|])`).test(conditionText));
+  });
 }
 function absentMapLookup(statement, source) {
   const initializer = statement.childForFieldName("initializer");

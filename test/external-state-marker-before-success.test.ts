@@ -47,6 +47,15 @@ func (c *controller) Ensure(name string) error {
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
 });
 
+test("stays quiet when an accumulated failure is returned before the marker", async () => {
+  const source = vulnerableSource().replace(
+    "  rm.rules[rule] = ruleState{metadata: metadata, delete: false}",
+    "  if retErr != nil { return retErr }\n  rm.rules[rule] = ruleState{metadata: metadata, delete: false}",
+  );
+  const output = await review(await repository({ "deferred.go": source }));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
 test("requires the exact lookup/write relationship and an external-looking mutation", async () => {
   const output = await review(await repository({
     "different.go": vulnerableSource().replace(
