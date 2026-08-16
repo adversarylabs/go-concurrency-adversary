@@ -17,6 +17,7 @@ export async function reviewConcurrency(
   const cancellation = matching(analysis, "go-concurrency.context.cancellation");
   const detachedContexts = matching(analysis, "go-concurrency.context.background-in-request");
   const cancellationErrors = matching(analysis, "go-concurrency.context.error-classification");
+  const storedContexts = matching(analysis, "go-concurrency.context.stored-on-struct");
   const selectBusy = matching(analysis, "go-concurrency.select.default-busy");
   const tickers = matching(analysis, "go-concurrency.ticker.not-stopped");
   const timers = matching(analysis, "go-concurrency.timer.not-stopped");
@@ -96,6 +97,15 @@ export async function reviewConcurrency(
     whyItMatters: "The caller's context carries its cancellation and deadline. Replacing it silently detaches blocking work from request, poll, and shutdown lifecycles.",
     impact: "A slow API call can continue after its owner stops waiting, causing timeout overruns, delayed shutdown, or leaked work.",
     recommendation: "Pass the available context through, including as the parent of WithTimeout/WithCancel. If work must deliberately outlive cancellation, make that explicit with context.WithoutCancel(ctx) and add an appropriate bound.",
+  });
+  emitGroupedFinding(ctx, storedContexts, {
+    title: "A struct stores context.Context as a field",
+    category: "reliability",
+    severity: "medium",
+    summary: (count) => `${count} type${count === 1 ? " stores" : "s store"} context.Context on a struct field.`,
+    whyItMatters: "Context is request-scoped cancellation and deadline state. Storing it on a long-lived client or helper hides the caller's cancel and forces later methods to invent a context.",
+    impact: "Methods keep working after the caller cancels, or they start from context.Background and ignore the deadline the caller already had.",
+    recommendation: "Pass context.Context as the first parameter of each function that needs it. Do not store it on Client, Worker, or other long-lived types.",
   });
   emitGroupedFinding(ctx, cancellationErrors, {
     title: "Context cancellation is handled as an ordinary failure",
@@ -188,6 +198,7 @@ export async function reviewConcurrency(
   if (cancellation.length > 0) staticSeverities.push("medium");
   if (detachedContexts.length > 0) staticSeverities.push("medium");
   if (cancellationErrors.length > 0) staticSeverities.push("medium");
+  if (storedContexts.length > 0) staticSeverities.push("medium");
   if (selectBusy.length > 0) staticSeverities.push("medium");
   if (tickers.length > 0) staticSeverities.push("medium");
   if (timers.length > 0) staticSeverities.push(timerSeverity(analysis.goVersion));
@@ -207,6 +218,7 @@ export async function reviewConcurrency(
     goroutineIDStateKeys.length > 0 ? "goroutine identifiers used as mutable state keys" :
     cancellation.length > 0 ? "discarded cancellation ownership" :
     detachedContexts.length > 0 ? "operations detached from caller cancellation" :
+    storedContexts.length > 0 ? "context.Context stored on structs" :
     cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" :
     selectBusy.length > 0 ? "busy-spinning select defaults" :
     tickers.length > 0 ? "tickers without Stop" :
@@ -234,6 +246,7 @@ export async function reviewConcurrency(
     loopVars,
     cancellation,
     detachedContexts,
+    storedContexts,
     cancellationErrors,
     selectBusy,
     tickers,
@@ -334,6 +347,7 @@ function addAssessment(
     loopVars: Signal[];
     cancellation: Signal[];
     detachedContexts: Signal[];
+    storedContexts: Signal[];
     cancellationErrors: Signal[];
     selectBusy: Signal[];
     tickers: Signal[];
@@ -463,6 +477,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would propagate the caller context or make deliberate detachment explicit and bounded before merging.",
+    });
+    return;
+  }
+  if (groups.storedContexts.length > 0) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "A long-lived type stores context.Context, so later methods cannot observe the caller's cancellation or deadline.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would pass context as a function parameter instead of storing it on the struct before merging.",
     });
     return;
   }

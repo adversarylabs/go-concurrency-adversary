@@ -72,6 +72,19 @@ Regression entry: graded fixtures and corpus under `test/`.
 | **Stays quiet when** | defer cancel(); derive child contexts |
 | **Remediation** | Always defer cancel and pass derived ctx |
 
+### `go-concurrency.context.stored-on-struct`
+
+| | |
+| --- | --- |
+| **What** | A struct field stores `context.Context` (or a same-file named alias of it) |
+| **Why** | Context is request-scoped. A field on Client/Worker hides the caller's cancel and later methods invent `context.Background()` |
+| **Looks for** | Non-test Go struct fields whose type is `context.Context`, `*context.Context`, an import-aliased `Context`, a same-file defined/alias type of those, or an embedded `context.Context` |
+| **Stays quiet when** | The only `context.Context` use is a function parameter; the file is `_test.go`; the field lives only on a request/options/params/args/event type that is not stored on another struct and is not a package-level var |
+| **Deliberate false negatives** | Short-lived bags not named like request/options; context aliases defined in another file; generic struct fields |
+| **Public grounding** | [argoproj/argo-cd#28734](https://github.com/argoproj/argo-cd/pull/28734) — do not set a context on a struct; pass it as the first parameter |
+| **Remediation** | Pass `ctx` as the first parameter of each function that needs it |
+| **Fixture** | `fixtures/p0-context-stored-on-struct/` |
+
 ### `go-concurrency.atomic-capacity-check-update`
 
 | | |

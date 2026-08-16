@@ -21148,6 +21148,7 @@ async function analyzeFile(file) {
     analyzeContextDetachment(file, tree.rootNode, aliases, signals);
     analyzeGoroutineIDStateKeys(file, tree.rootNode, previousTree?.rootNode, aliases, signals);
     analyzePrematureExternalStateMarker(file, tree.rootNode, previousTree?.rootNode, signals);
+    analyzeStoredContextFields(file, tree.rootNode, aliases, signals);
     for (const fn of [
       ...descendants(tree.rootNode, "function_declaration"),
       ...descendants(tree.rootNode, "method_declaration")
@@ -22441,6 +22442,114 @@ function helperCall(call, source, helpers) {
   const enclosing = findEnclosingCallable(call);
   if (enclosing !== null && isLocallyShadowedAt(enclosing, call, source, helper)) return void 0;
   return { helper, ...resolved };
+}
+function analyzeStoredContextFields(file, root, aliases, signals) {
+  if (file.path.endsWith("_test.go")) return;
+  const contextTypes = contextTypeNames(root, file.current, aliases);
+  if (contextTypes.size === 0) return;
+  for (const fact of collectStoredContextFields(root, file.current, new Set(contextTypes.keys()))) {
+    if (isShortLivedRequestOptionsType(fact.typeName, root, file.current)) continue;
+    const normalizedType = normalizeGoType(fact.typeText);
+    const typeEvidence = contextTypes.get(normalizedType) ?? [];
+    const anchor = [fact.field, ...typeEvidence].find((node) => isChangedEvidence(file, node.startPosition.row + 1, node.endPosition.row + 1)) ?? fact.field;
+    signals.push(signal(
+      file,
+      anchor,
+      "go-concurrency.context.stored-on-struct",
+      `${fact.typeName} stores ${fact.typeText} on field ${fact.fieldName}; pass context as the first parameter of each method that needs it.`,
+      {
+        form: "struct-field-context",
+        type: fact.typeName,
+        field: fact.fieldName
+      }
+    ));
+  }
+}
+function contextTypeNames(root, source, aliases) {
+  const names = /* @__PURE__ */ new Map();
+  const imported = aliases.get("context");
+  if (imported !== void 0) {
+    const importSpec = descendants(root, "import_spec").find((spec) => /["`]context["`]$/.test(sourceText(spec, source).trim()));
+    if (importSpec !== void 0) names.set(`${imported}.Context`, [importSpec]);
+  }
+  const specs = [...descendants(root, "type_spec"), ...descendants(root, "type_alias")];
+  let discovered = true;
+  while (discovered) {
+    discovered = false;
+    for (const spec of specs) {
+      const name2 = spec.childForFieldName("name");
+      const type = spec.childForFieldName("type");
+      if (name2 === null || type === null) continue;
+      const typeName = sourceText(name2, source);
+      if (names.has(typeName)) continue;
+      const normalized = normalizeGoType(sourceText(type, source));
+      if (names.has(normalized)) {
+        names.set(typeName, [spec, ...names.get(normalized)]);
+        discovered = true;
+      }
+    }
+  }
+  return names;
+}
+function normalizeGoType(text) {
+  return text.replace(/\s+/g, "").replace(/^\*+/, "");
+}
+function isContextFieldType(typeNode, source, contextNames) {
+  return contextNames.has(normalizeGoType(sourceText(typeNode, source)));
+}
+function collectStoredContextFields(root, source, contextNames) {
+  const facts = [];
+  for (const spec of [...descendants(root, "type_spec"), ...descendants(root, "type_alias")]) {
+    const name2 = spec.childForFieldName("name");
+    const type = spec.childForFieldName("type");
+    if (name2 === null || type?.type !== "struct_type") continue;
+    const typeName = sourceText(name2, source);
+    for (const field of descendants(type, "field_declaration")) {
+      if (nearestAncestor(field, "struct_type")?.id !== type.id) continue;
+      const fieldType = field.childForFieldName("type");
+      if (fieldType === null || !isContextFieldType(fieldType, source, contextNames)) continue;
+      const typeText = sourceText(fieldType, source).replace(/\s+/g, "");
+      const declared = directDeclaredNames(field, source);
+      if (declared.length === 0) {
+        facts.push({ typeName, fieldName: typeText, typeText, field });
+        continue;
+      }
+      for (const fieldName of declared) {
+        facts.push({ typeName, fieldName, typeText, field });
+      }
+    }
+  }
+  return facts;
+}
+function isRequestOptionsTypeName(typeName) {
+  return /(?:request|req|options|opts|params|args|event)$/i.test(typeName);
+}
+function isShortLivedRequestOptionsType(typeName, root, source) {
+  if (!isRequestOptionsTypeName(typeName)) return false;
+  for (const spec of descendants(root, "type_spec")) {
+    const name2 = spec.childForFieldName("name");
+    const type = spec.childForFieldName("type");
+    if (name2 === null || type?.type !== "struct_type") continue;
+    if (sourceText(name2, source) === typeName) continue;
+    for (const field of descendants(type, "field_declaration")) {
+      if (nearestAncestor(field, "struct_type")?.id !== type.id) continue;
+      const fieldType = field.childForFieldName("type");
+      if (fieldType === null) continue;
+      if (typeMentionsNamedType(sourceText(fieldType, source), typeName)) return false;
+    }
+  }
+  for (const spec of descendants(root, "var_spec")) {
+    if (findEnclosingFunction(spec) !== null) continue;
+    const type = spec.childForFieldName("type");
+    if (type !== null && normalizeGoType(sourceText(type, source)) === typeName) return false;
+    const value = spec.childForFieldName("value");
+    if (value !== null && initializedNamedType(sourceText(value, source)) === typeName) return false;
+  }
+  return true;
+}
+function typeMentionsNamedType(typeText, typeName) {
+  const normalized = typeText.replace(/\s+/g, "");
+  return new RegExp(`(^|[^A-Za-z0-9_])${escapeRegExp(typeName)}($|[^A-Za-z0-9_])`).test(normalized);
 }
 function analyzeContextDetachment(file, root, aliases, signals) {
   const contextAlias = aliases.get("context");
@@ -23815,6 +23924,7 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
   const cancellation = matching(analysis, "go-concurrency.context.cancellation");
   const detachedContexts = matching(analysis, "go-concurrency.context.background-in-request");
   const cancellationErrors = matching(analysis, "go-concurrency.context.error-classification");
+  const storedContexts = matching(analysis, "go-concurrency.context.stored-on-struct");
   const selectBusy = matching(analysis, "go-concurrency.select.default-busy");
   const tickers = matching(analysis, "go-concurrency.ticker.not-stopped");
   const timers = matching(analysis, "go-concurrency.timer.not-stopped");
@@ -23893,6 +24003,15 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
     whyItMatters: "The caller's context carries its cancellation and deadline. Replacing it silently detaches blocking work from request, poll, and shutdown lifecycles.",
     impact: "A slow API call can continue after its owner stops waiting, causing timeout overruns, delayed shutdown, or leaked work.",
     recommendation: "Pass the available context through, including as the parent of WithTimeout/WithCancel. If work must deliberately outlive cancellation, make that explicit with context.WithoutCancel(ctx) and add an appropriate bound."
+  });
+  emitGroupedFinding(ctx, storedContexts, {
+    title: "A struct stores context.Context as a field",
+    category: "reliability",
+    severity: "medium",
+    summary: (count) => `${count} type${count === 1 ? " stores" : "s store"} context.Context on a struct field.`,
+    whyItMatters: "Context is request-scoped cancellation and deadline state. Storing it on a long-lived client or helper hides the caller's cancel and forces later methods to invent a context.",
+    impact: "Methods keep working after the caller cancels, or they start from context.Background and ignore the deadline the caller already had.",
+    recommendation: "Pass context.Context as the first parameter of each function that needs it. Do not store it on Client, Worker, or other long-lived types."
   });
   emitGroupedFinding(ctx, cancellationErrors, {
     title: "Context cancellation is handled as an ordinary failure",
@@ -23977,6 +24096,7 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
   if (cancellation.length > 0) staticSeverities.push("medium");
   if (detachedContexts.length > 0) staticSeverities.push("medium");
   if (cancellationErrors.length > 0) staticSeverities.push("medium");
+  if (storedContexts.length > 0) staticSeverities.push("medium");
   if (selectBusy.length > 0) staticSeverities.push("medium");
   if (tickers.length > 0) staticSeverities.push("medium");
   if (timers.length > 0) staticSeverities.push(timerSeverity(analysis.goVersion));
@@ -23984,7 +24104,7 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
   if (prematureStateMarkers.length > 0) staticSeverities.push("high");
   if (goroutineIDStateKeys.length > 0) staticSeverities.push("medium");
   if (concurrentApiMissing.length > 0) staticSeverities.push("medium");
-  const staticPrimaryConcern = deadlocks.length > 0 ? "local channel self-deadlocks" : mutexCopy.length > 0 ? "copied mutex values" : waitGroups.length > 0 ? "WaitGroup registration races" : waitGroupCompletion.length > 0 ? "skippable WaitGroup completion" : waitGroupCopied.length > 0 ? "WaitGroup value copies" : loopVars.length > 0 ? "loop variable captures in goroutines" : atomicCapacity.length > 0 ? "non-atomic capacity admission" : prematureStateMarkers.length > 0 ? "failed external work recorded as completed local state" : goroutineIDStateKeys.length > 0 ? "goroutine identifiers used as mutable state keys" : cancellation.length > 0 ? "discarded cancellation ownership" : detachedContexts.length > 0 ? "operations detached from caller cancellation" : cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" : selectBusy.length > 0 ? "busy-spinning select defaults" : tickers.length > 0 ? "tickers without Stop" : timers.length > 0 ? "time.After inside loops" : concurrentApiMissing.length > 0 ? "missing tests for concurrent API serialization" : void 0;
+  const staticPrimaryConcern = deadlocks.length > 0 ? "local channel self-deadlocks" : mutexCopy.length > 0 ? "copied mutex values" : waitGroups.length > 0 ? "WaitGroup registration races" : waitGroupCompletion.length > 0 ? "skippable WaitGroup completion" : waitGroupCopied.length > 0 ? "WaitGroup value copies" : loopVars.length > 0 ? "loop variable captures in goroutines" : atomicCapacity.length > 0 ? "non-atomic capacity admission" : prematureStateMarkers.length > 0 ? "failed external work recorded as completed local state" : goroutineIDStateKeys.length > 0 ? "goroutine identifiers used as mutable state keys" : cancellation.length > 0 ? "discarded cancellation ownership" : detachedContexts.length > 0 ? "operations detached from caller cancellation" : storedContexts.length > 0 ? "context.Context stored on structs" : cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" : selectBusy.length > 0 ? "busy-spinning select defaults" : tickers.length > 0 ? "tickers without Stop" : timers.length > 0 ? "time.After inside loops" : concurrentApiMissing.length > 0 ? "missing tests for concurrent API serialization" : void 0;
   await attachImportNavigation(ctx, analysis);
   const modelStatus = await runModelConcurrencyReview(
     ctx,
@@ -24005,6 +24125,7 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
     loopVars,
     cancellation,
     detachedContexts,
+    storedContexts,
     cancellationErrors,
     selectBusy,
     tickers,
@@ -24192,6 +24313,17 @@ function addAssessment(ctx, groups) {
     });
     return;
   }
+  if (groups.storedContexts.length > 0) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "A long-lived type stores context.Context, so later methods cannot observe the caller's cancellation or deadline."
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would pass context as a function parameter instead of storing it on the struct before merging."
+    });
+    return;
+  }
   if (groups.cancellationErrors.length > 0) {
     ctx.review.assessment({
       risk: "medium",
@@ -24262,7 +24394,7 @@ function addAssessment(ctx, groups) {
 function createApp() {
   const app = new Adversary({
     name: "go-concurrency",
-    version: "0.0.20",
+    version: "0.0.21",
     review: { maximumFindings: 5, minimumConfidence: "medium" }
   });
   app.rule("go-concurrency.review", async (ctx) => {
