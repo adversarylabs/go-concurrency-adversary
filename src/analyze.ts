@@ -39,6 +39,7 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
     const positives: PositiveSignal[] = [];
     analyzeContextDetachment(file, tree.rootNode, aliases, signals);
     analyzeGoroutineIDStateKeys(file, tree.rootNode, previousTree?.rootNode, aliases, signals);
+    analyzePrematureExternalStateMarker(file, tree.rootNode, previousTree?.rootNode, signals);
     for (const fn of [
       ...descendants(tree.rootNode, "function_declaration"),
       ...descendants(tree.rootNode, "method_declaration"),
@@ -57,6 +58,282 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
     previousTree?.delete();
     tree.delete();
   }
+}
+
+interface PrematureStateMarker {
+  signature: string;
+  functionName: string;
+  state: string;
+  key: string;
+  operation: string;
+  lookup: Node;
+  errorGuard: Node;
+  operationCall: Node;
+  marker: Node;
+  evidence: Node[];
+}
+
+/**
+ * Detect the narrow retry-suppression shape where map presence gates an external
+ * operation, the operation's error path falls through, and the same map entry is
+ * then written unconditionally. The map relationship is the proof that the write
+ * is a success/ownership marker: on the next call it skips the operation.
+ */
+function analyzePrematureExternalStateMarker(
+  file: SourceRevision,
+  root: Node,
+  previousRoot: Node | undefined,
+  signals: Signal[],
+): void {
+  if (file.path.endsWith("_test.go")) return;
+  const current = collectPrematureStateMarkers(root, file.current);
+  if (current.length === 0) return;
+  const previous = previousRoot === undefined || file.previous === undefined
+    ? new Set<string>()
+    : new Set(collectPrematureStateMarkers(previousRoot, file.previous).map((fact) => fact.signature));
+
+  for (const fact of current) {
+    // Repository scans report the current defect. Diff scans require a semantic
+    // relationship that was not already present in the base revision.
+    if (file.status === "modified" && previous.has(fact.signature)) continue;
+    const anchor = fact.evidence.find((node) =>
+      isChangedEvidence(file, node.startPosition.row + 1, node.endPosition.row + 1));
+    if (file.status === "modified" && anchor === undefined) continue;
+    signals.push(signal(
+      file,
+      anchor ?? fact.marker,
+      "go-concurrency.external-state-marker-before-success",
+      `${fact.state}[${fact.key}] is recorded after ${fact.operation} can fail; that entry skips the external operation on a retry.`,
+      {
+        form: "map-presence-skips-failed-external-operation",
+        function: fact.functionName,
+        state: fact.state,
+        key: fact.key,
+        operation: fact.operation,
+        lookupLine: fact.lookup.startPosition.row + 1,
+        errorLine: fact.errorGuard.startPosition.row + 1,
+        markerLine: fact.marker.startPosition.row + 1,
+      },
+    ));
+  }
+}
+
+function collectPrematureStateMarkers(root: Node, source: string): PrematureStateMarker[] {
+  const facts: PrematureStateMarker[] = [];
+  for (const fn of [
+    ...descendants(root, "function_declaration"),
+    ...descendants(root, "method_declaration"),
+  ]) {
+    const body = fn.childForFieldName("body");
+    if (body === null) continue;
+    const functionName = functionNameOf(fn, source) ?? "anonymous";
+    const lists = functionDescendants(fn, body, "statement_list");
+    for (const list of lists) {
+      const statements = list.namedChildren;
+      for (let index = 0; index < statements.length; index += 1) {
+        const lookupIf = statements[index];
+        if (lookupIf?.type !== "if_statement") continue;
+        const lookup = absentMapLookup(lookupIf, source);
+        if (lookup === undefined) continue;
+        const consequence = lookupIf.childForFieldName("consequence");
+        if (consequence === null) continue;
+        const failure = fallthroughExternalFailure(fn, consequence, source, lookup.state);
+        if (failure === undefined) continue;
+        let marker: Node | undefined;
+        let markerIndex = -1;
+        for (let candidate = index + 1; candidate < statements.length; candidate += 1) {
+          marker = sameMapEntryWrite(statements[candidate]!, source, lookup.state, lookup.key);
+          if (marker !== undefined) {
+            markerIndex = candidate;
+            break;
+          }
+        }
+        if (marker === undefined) continue;
+        if (failureHandledBeforeMarker(
+          statements.slice(index + 1, markerIndex), failure.failureStatements, fn, source)) continue;
+        const evidence = [
+          marker,
+          failure.call,
+          failure.condition,
+          ...failure.failureStatements,
+          lookup.initializer,
+          lookup.condition,
+        ];
+        const signature = [
+          functionName,
+          semanticText(lookup.state),
+          semanticText(lookup.key),
+          semanticText(sourceText(failure.call, source)),
+          semanticText(sourceText(failure.condition, source)),
+          semanticText(sourceText(marker, source)),
+        ].join("|");
+        facts.push({
+          signature,
+          functionName,
+          state: lookup.state,
+          key: lookup.key,
+          operation: sourceText(failure.call.childForFieldName("function")!, source),
+          lookup: lookupIf,
+          errorGuard: failure.guard,
+          operationCall: failure.call,
+          marker,
+          evidence,
+        });
+      }
+    }
+  }
+  return facts;
+}
+
+function failureHandledBeforeMarker(
+  statements: Node[],
+  failureStatements: Node[],
+  fn: Node,
+  source: string,
+): boolean {
+  if (statements.some((statement) => statement.type === "return_statement")) return true;
+  const assigned = new Set<string>();
+  for (const statement of failureStatements) {
+    for (const assignment of descendants(statement, "assignment_statement")) {
+      for (const left of assignment.childForFieldName("left")?.namedChildren ?? []) {
+        if (left.type === "identifier") assigned.add(sourceText(left, source));
+      }
+    }
+    if (statement.type === "assignment_statement") {
+      for (const left of statement.childForFieldName("left")?.namedChildren ?? []) {
+        if (left.type === "identifier") assigned.add(sourceText(left, source));
+      }
+    }
+  }
+  if (assigned.size === 0) return false;
+  return statements.some((statement) => {
+    if (statement.type !== "if_statement") return false;
+    const condition = statement.childForFieldName("condition");
+    const consequence = statement.childForFieldName("consequence");
+    if (condition === null || consequence === null || !blockTerminates(consequence, fn, source, true)) return false;
+    const conditionText = semanticText(sourceText(condition, source));
+    return [...assigned].some((name) =>
+      new RegExp(`(?:^|[(&|])${escapeRegExp(name)}!=nil(?:$|[)&|])`).test(conditionText));
+  });
+}
+
+function absentMapLookup(
+  statement: Node,
+  source: string,
+): { state: string; key: string; initializer: Node; condition: Node } | undefined {
+  const initializer = statement.childForFieldName("initializer");
+  const condition = statement.childForFieldName("condition");
+  if (initializer?.type !== "short_var_declaration" || condition === null) return undefined;
+  const left = initializer.childForFieldName("left")?.namedChildren ?? [];
+  const right = initializer.childForFieldName("right")?.namedChildren ?? [];
+  if (left.length !== 2 || right.length !== 1 || right[0]?.type !== "index_expression") return undefined;
+  const okName = sourceText(left[1]!, source);
+  if (okName === "_" || !conditionMeansAbsent(condition, source, okName)) return undefined;
+  const operand = right[0].childForFieldName("operand");
+  const key = right[0].childForFieldName("index");
+  if (operand === null || key === null) return undefined;
+  return {
+    state: sourceText(operand, source),
+    key: sourceText(key, source),
+    initializer,
+    condition,
+  };
+}
+
+function conditionMeansAbsent(condition: Node, source: string, okName: string): boolean {
+  const text = semanticText(sourceText(condition, source));
+  const escaped = escapeRegExp(okName);
+  return new RegExp(`^!${escaped}$`).test(text) ||
+    new RegExp(`^(?:${escaped}==false|false==${escaped})$`).test(text);
+}
+
+function fallthroughExternalFailure(
+  fn: Node,
+  consequence: Node,
+  source: string,
+  state: string,
+): { guard: Node; call: Node; condition: Node; failureStatements: Node[] } | undefined {
+  for (const guard of directScopeDescendants(consequence, "if_statement")) {
+    const initializer = guard.childForFieldName("initializer");
+    const condition = guard.childForFieldName("condition");
+    const failureBlock = guard.childForFieldName("consequence");
+    if (initializer?.type !== "short_var_declaration" || condition === null || failureBlock === null) continue;
+    const names = initializer.childForFieldName("left")?.namedChildren ?? [];
+    const values = initializer.childForFieldName("right")?.namedChildren ?? [];
+    if (names.length !== 1 || values.length !== 1 || values[0]?.type !== "call_expression") continue;
+    const errorName = sourceText(names[0]!, source);
+    if (errorName === "_") continue;
+    const conditionText = semanticText(sourceText(condition, source));
+    if (!new RegExp(`(?:^|[(&|])${escapeRegExp(errorName)}!=nil(?:$|[)&|])`).test(conditionText)) continue;
+    const call = values[0];
+    const selected = selectedCall(call, source);
+    if (selected === undefined || !externalMutationName(selected.field)) continue;
+    const stateRoot = state.split(".")[0];
+    const operationRoot = selected.operand.split(".")[0];
+    if (stateRoot !== undefined && operationRoot === stateRoot) continue;
+    if (blockTerminates(failureBlock, fn, source, true)) continue;
+    const failureStatements = failureBlock.namedChildren
+      .find((node) => node.type === "statement_list")?.namedChildren ?? [];
+    return { guard, call, condition, failureStatements };
+  }
+  return undefined;
+}
+
+function externalMutationName(name: string): boolean {
+  return /(?:^|_)(?:Add|Apply|Commit|Create|Do|Install|Provision|Publish|Put|Replicate|Send|Start|Sync|Upload|Write)$/i.test(name) ||
+    /(?:Add|Apply|Commit|Create|Install|Provision|Publish|Put|Replicate|Send|Start|Sync|Upload|Write)$/i.test(name);
+}
+
+function sameMapEntryWrite(statement: Node, source: string, state: string, key: string): Node | undefined {
+  if (statement.type !== "assignment_statement") return undefined;
+  const left = statement.childForFieldName("left")?.namedChildren ?? [];
+  if (left.length !== 1 || left[0]?.type !== "index_expression") return undefined;
+  const operand = left[0].childForFieldName("operand");
+  const index = left[0].childForFieldName("index");
+  if (operand === null || index === null) return undefined;
+  return semanticText(sourceText(operand, source)) === semanticText(state) &&
+    semanticText(sourceText(index, source)) === semanticText(key) ? statement : undefined;
+}
+
+function semanticText(value: string): string {
+  let result = "";
+  let index = 0;
+  let quote: "\"" | "'" | "`" | undefined;
+  while (index < value.length) {
+    const char = value[index]!;
+    const next = value[index + 1];
+    if (quote !== undefined) {
+      result += char;
+      if (quote !== "`" && char === "\\" && next !== undefined) {
+        result += next;
+        index += 2;
+        continue;
+      }
+      if (char === quote) quote = undefined;
+      index += 1;
+      continue;
+    }
+    if (char === "\"" || char === "'" || char === "`") {
+      quote = char;
+      result += char;
+      index += 1;
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      index += 2;
+      while (index < value.length && value[index] !== "\n") index += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      index += 2;
+      while (index + 1 < value.length && !(value[index] === "*" && value[index + 1] === "/")) index += 1;
+      index += 2;
+      continue;
+    }
+    if (!/\s/.test(char)) result += char;
+    index += 1;
+  }
+  return result;
 }
 
 function analyzeGoroutineIDStateKeys(

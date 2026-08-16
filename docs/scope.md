@@ -19,6 +19,7 @@ Review Go concurrency: lifecycle, cancellation, synchronization, races, and chan
 - Channel ownership and close races; select starvation
 - Deadlocks, lock ordering, incorrect mutex use
 - Production mutable state keyed by goroutine identifiers parsed from runtime stack text
+- Local success/ownership markers written after a failed external mutation that later skips retries
 - Concurrent API guarantees not tested (overlapping Export/Flush/Shutdown, etc.)
 
 ## Out of scope (not a miss for this adversary)

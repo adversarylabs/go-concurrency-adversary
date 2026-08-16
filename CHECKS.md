@@ -97,6 +97,16 @@ Regression entry: graded fixtures and corpus under `test/`.
 
 Map-type resolution is intentionally limited to simple, non-generic defined types and aliases declared in the reviewed file. Imported, generic, and cross-file type graphs stay out of deterministic scope unless their mutable map type can be proven locally.
 
+### `go-concurrency.external-state-marker-before-success`
+
+| | |
+| --- | --- |
+| **What** | A local success/ownership map entry is written after an external mutation whose error path falls through |
+| **Why** | The same map presence check skips the external call on retry, so a failed Create/Add can be treated as already done |
+| **Looks for** | `if _, ok := state[key]; !ok` (or `ok == false`), an external-looking mutation whose `err != nil` path does not return, then an unconditional `state[key] = ...` in the same function |
+| **Stays quiet when** | The failure path returns before the write; the write is inside `if err == nil`; the follow-up write is a different map or an attempts counter; the call is on the same state object; tests |
+| **Remediation** | Return on the failed external operation, or write the local marker only after success |
+
 ### `go-concurrency.context.error-classification`
 
 | | |
