@@ -27,6 +27,7 @@ export interface Signal {
     | "go-concurrency.context.cancellation"
     | "go-concurrency.context.background-in-request"
     | "go-concurrency.context.error-classification"
+    | "go-concurrency.context.stored-on-struct"
     | "go-concurrency.select.default-busy"
     | "go-concurrency.ticker.not-stopped"
     | "go-concurrency.timer.not-stopped"

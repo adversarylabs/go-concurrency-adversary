@@ -29,6 +29,7 @@ test("P0 catalog concurrency rules detect vulnerable fixtures and stay quiet on 
     { dir: "p0-context-cancellation", id: "go-concurrency.context.cancellation" },
     { dir: "p0-context-background-in-request", id: "go-concurrency.context.background-in-request" },
     { dir: "p0-context-error-classification", id: "go-concurrency.context.error-classification" },
+    { dir: "p0-context-stored-on-struct", id: "go-concurrency.context.stored-on-struct" },
     { dir: "p0-select-default-busy", id: "go-concurrency.select.default-busy" },
     { dir: "p0-ticker-not-stopped", id: "go-concurrency.ticker.not-stopped" },
     { dir: "p0-timer-not-stopped", id: "go-concurrency.timer.not-stopped" },

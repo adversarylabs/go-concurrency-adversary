@@ -40,6 +40,7 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
     analyzeContextDetachment(file, tree.rootNode, aliases, signals);
     analyzeGoroutineIDStateKeys(file, tree.rootNode, previousTree?.rootNode, aliases, signals);
     analyzePrematureExternalStateMarker(file, tree.rootNode, previousTree?.rootNode, signals);
+    analyzeStoredContextFields(file, tree.rootNode, aliases, signals);
     for (const fn of [
       ...descendants(tree.rootNode, "function_declaration"),
       ...descendants(tree.rootNode, "method_declaration"),
@@ -1664,6 +1665,125 @@ function helperCall(
   const enclosing = findEnclosingCallable(call);
   if (enclosing !== null && isLocallyShadowedAt(enclosing, call, source, helper)) return undefined;
   return { helper, ...resolved };
+}
+
+function analyzeStoredContextFields(
+  file: SourceRevision,
+  root: Node,
+  aliases: Map<string, string>,
+  signals: Signal[],
+): void {
+  if (file.path.endsWith("_test.go")) return;
+  const contextNames = contextTypeNames(root, file.current, aliases);
+  if (contextNames.size === 0) return;
+  for (const fact of collectStoredContextFields(root, file.current, contextNames)) {
+    if (isShortLivedRequestOptionsType(fact.typeName, root, file.current)) continue;
+    signals.push(signal(
+      file,
+      fact.field,
+      "go-concurrency.context.stored-on-struct",
+      `${fact.typeName} stores ${fact.typeText} on field ${fact.fieldName}; pass context as the first parameter of each method that needs it.`,
+      {
+        form: "struct-field-context",
+        type: fact.typeName,
+        field: fact.fieldName,
+      },
+    ));
+  }
+}
+
+function contextTypeNames(root: Node, source: string, aliases: Map<string, string>): Set<string> {
+  const names = new Set<string>();
+  const imported = aliases.get("context");
+  if (imported !== undefined) names.add(`${imported}.Context`);
+  const specs = [...descendants(root, "type_spec"), ...descendants(root, "type_alias")];
+  let discovered = true;
+  while (discovered) {
+    discovered = false;
+    for (const spec of specs) {
+      const name = spec.childForFieldName("name");
+      const type = spec.childForFieldName("type");
+      if (name === null || type === null) continue;
+      const typeName = sourceText(name, source);
+      if (names.has(typeName)) continue;
+      const normalized = normalizeGoType(sourceText(type, source));
+      if (names.has(normalized)) {
+        names.add(typeName);
+        discovered = true;
+      }
+    }
+  }
+  return names;
+}
+
+function normalizeGoType(text: string): string {
+  return text.replace(/\s+/g, "").replace(/^\*+/, "");
+}
+
+function isContextFieldType(typeNode: Node, source: string, contextNames: Set<string>): boolean {
+  return contextNames.has(normalizeGoType(sourceText(typeNode, source)));
+}
+
+interface StoredContextField {
+  typeName: string;
+  fieldName: string;
+  typeText: string;
+  field: Node;
+}
+
+function collectStoredContextFields(
+  root: Node,
+  source: string,
+  contextNames: Set<string>,
+): StoredContextField[] {
+  const facts: StoredContextField[] = [];
+  for (const spec of [...descendants(root, "type_spec"), ...descendants(root, "type_alias")]) {
+    const name = spec.childForFieldName("name");
+    const type = spec.childForFieldName("type");
+    if (name === null || type?.type !== "struct_type") continue;
+    const typeName = sourceText(name, source);
+    for (const field of descendants(type, "field_declaration")) {
+      if (nearestAncestor(field, "struct_type")?.id !== type.id) continue;
+      const fieldType = field.childForFieldName("type");
+      if (fieldType === null || !isContextFieldType(fieldType, source, contextNames)) continue;
+      const typeText = sourceText(fieldType, source).replace(/\s+/g, "");
+      const declared = directDeclaredNames(field, source);
+      if (declared.length === 0) {
+        facts.push({ typeName, fieldName: typeText, typeText, field });
+        continue;
+      }
+      for (const fieldName of declared) {
+        facts.push({ typeName, fieldName, typeText, field });
+      }
+    }
+  }
+  return facts;
+}
+
+function isRequestOptionsTypeName(typeName: string): boolean {
+  return /(?:request|req|options|opts|params|args|event)$/i.test(typeName);
+}
+
+function isShortLivedRequestOptionsType(typeName: string, root: Node, source: string): boolean {
+  if (!isRequestOptionsTypeName(typeName)) return false;
+  for (const spec of descendants(root, "type_spec")) {
+    const name = spec.childForFieldName("name");
+    const type = spec.childForFieldName("type");
+    if (name === null || type?.type !== "struct_type") continue;
+    if (sourceText(name, source) === typeName) continue;
+    for (const field of descendants(type, "field_declaration")) {
+      if (nearestAncestor(field, "struct_type")?.id !== type.id) continue;
+      const fieldType = field.childForFieldName("type");
+      if (fieldType === null) continue;
+      if (normalizeGoType(sourceText(fieldType, source)) === typeName) return false;
+    }
+  }
+  for (const spec of descendants(root, "var_spec")) {
+    if (findEnclosingFunction(spec) !== null) continue;
+    const type = spec.childForFieldName("type");
+    if (type !== null && normalizeGoType(sourceText(type, source)) === typeName) return false;
+  }
+  return true;
 }
 
 function analyzeContextDetachment(
