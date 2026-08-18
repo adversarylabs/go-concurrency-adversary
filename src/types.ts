@@ -35,6 +35,7 @@ export interface Signal {
     | "go-concurrency.waitgroup.done-not-deferred"
     | "go-concurrency.atomic-capacity-check-update"
     | "go-concurrency.goroutine-id-state-key"
+    | "go-concurrency.async-listener.missing-shutdown"
     | "go-concurrency.external-state-marker-before-success"
     | "go-concurrency.concurrent-api.missing-test"
     | "go-concurrency.async-listener.missing-close";

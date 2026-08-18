@@ -1,9 +1,10 @@
 import { type Node } from "web-tree-sitter";
+import { analyzeAsyncListenerOwnership } from "./async-listener.js";
 import { descendants, parseGo, sourceText, walk } from "./parser.js";
 import { type Analysis, type Discovery, type PositiveSignal, type Signal, type SourceRevision } from "./types.js";
 
 export async function analyzeDiscovery(discovery: Discovery): Promise<Analysis> {
-  const signals: Signal[] = [];
+  const signals: Signal[] = await analyzeAsyncListenerOwnership(discovery);
   const positives: PositiveSignal[] = [];
   const parseErrors: Analysis["parseErrors"] = [];
 
