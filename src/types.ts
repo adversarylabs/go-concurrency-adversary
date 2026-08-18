@@ -36,7 +36,8 @@ export interface Signal {
     | "go-concurrency.atomic-capacity-check-update"
     | "go-concurrency.goroutine-id-state-key"
     | "go-concurrency.external-state-marker-before-success"
-    | "go-concurrency.concurrent-api.missing-test";
+    | "go-concurrency.concurrent-api.missing-test"
+    | "go-concurrency.async-listener.missing-close";
   path: string;
   line: number;
   endLine?: number;

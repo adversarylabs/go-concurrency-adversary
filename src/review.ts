@@ -25,6 +25,7 @@ export async function reviewConcurrency(
   const goroutineIDStateKeys = matching(analysis, "go-concurrency.goroutine-id-state-key");
   const prematureStateMarkers = matching(analysis, "go-concurrency.external-state-marker-before-success");
   const concurrentApiMissing = matching(analysis, "go-concurrency.concurrent-api.missing-test");
+  const asyncListenerMissingClose = matching(analysis, "go-concurrency.async-listener.missing-close");
 
   emitGroupedFinding(ctx, deadlocks, {
     title: "A local unbuffered channel blocks before a peer can run",
@@ -176,6 +177,20 @@ export async function reviewConcurrency(
     recommendation: "Return on the failed external operation, or write the local map entry only after success (including explicitly accepted already-exists outcomes).",
   });
 
+  emitGroupedFinding(ctx, asyncListenerMissingClose, {
+    title: "Async listener has no Close or Shutdown method",
+    category: "reliability",
+    severity: "high",
+    summary: (count) =>
+      `${count} type${count === 1 ? "" : "s"} start an asynchronous Serve/ListenAndServe and never implement Close or Shutdown in the same file.`,
+    whyItMatters:
+      "A discarded Serve or ListenAndServe call starts a listener goroutine. Without Close or Shutdown on the owning type, daemon teardown cannot stop that goroutine or the socket.",
+    impact:
+      "Shutdown leaks the listener goroutine and keeps the port bound, so later starts fail or the process cannot exit cleanly.",
+    recommendation:
+      "Add Close or Shutdown on the type that starts the listener and stop the server from that method. Return the Serve error when the call is meant to be blocking.",
+  });
+
   emitGroupedFinding(ctx, concurrentApiMissing, {
     title: "Concurrent API guarantee lacks test for overlapping calls",
     category: "correctness",
@@ -206,6 +221,7 @@ export async function reviewConcurrency(
   if (prematureStateMarkers.length > 0) staticSeverities.push("high");
   if (goroutineIDStateKeys.length > 0) staticSeverities.push("medium");
   if (concurrentApiMissing.length > 0) staticSeverities.push("medium");
+  if (asyncListenerMissingClose.length > 0) staticSeverities.push("high");
   const staticPrimaryConcern =
     deadlocks.length > 0 ? "local channel self-deadlocks" :
     mutexCopy.length > 0 ? "copied mutex values" :
@@ -224,6 +240,7 @@ export async function reviewConcurrency(
     tickers.length > 0 ? "tickers without Stop" :
     timers.length > 0 ? "time.After inside loops" :
     concurrentApiMissing.length > 0 ? "missing tests for concurrent API serialization" :
+    asyncListenerMissingClose.length > 0 ? "async listeners without Close or Shutdown" :
     undefined;
   await attachImportNavigation(ctx, analysis);
 
@@ -255,6 +272,7 @@ export async function reviewConcurrency(
     prematureStateMarkers,
     goroutineIDStateKeys,
     concurrentApiMissing,
+    asyncListenerMissingClose,
     ...(analysis.goVersion === undefined ? {} : { goVersion: analysis.goVersion }),
   });
 }
@@ -356,6 +374,7 @@ function addAssessment(
     prematureStateMarkers: Signal[];
     goroutineIDStateKeys: Signal[];
     concurrentApiMissing: Signal[];
+    asyncListenerMissingClose: Signal[];
     goVersion?: GoVersion;
   },
 ): void {
@@ -548,6 +567,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would add active-call counter or max-concurrency assertion inside the test harness before merging.",
+    });
+    return;
+  }
+  if (groups.asyncListenerMissingClose.length > 0) {
+    ctx.review.assessment({
+      risk: "high",
+      summary: "A type starts an asynchronous listener and has no Close or Shutdown method, so the listener goroutine can outlive daemon shutdown.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would add Close or Shutdown on the type that starts the listener before merging.",
     });
     return;
   }
