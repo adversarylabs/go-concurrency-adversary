@@ -24,6 +24,7 @@ Authority:
 - discarded cancel functions and errgroup context misuse
 - cancellation errors swallowed or reported as ordinary per-item failures
 - goroutine lifecycle that can leak or race on shutdown
+- listener-backed server wrappers that start Serve asynchronously but do not expose a Close/Shutdown path for the owned server
 - shared memory without synchronization when evidence is clear
 - capacity admission that reads an atomic counter, checks a max/limit, then increments separately; atomic operations do not make the compound check-and-update atomic. Accept a mutex, semaphore, or CAS retry that combines the check and reservation.
 - external mutation state machines where a failed call still writes the exact local map entry used to skip that operation on retries. Require the concrete lookup/call/write relationship; do not infer success from names alone.

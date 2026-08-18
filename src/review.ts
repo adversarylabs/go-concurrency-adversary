@@ -23,6 +23,7 @@ export async function reviewConcurrency(
   const timers = matching(analysis, "go-concurrency.timer.not-stopped");
   const atomicCapacity = matching(analysis, "go-concurrency.atomic-capacity-check-update");
   const goroutineIDStateKeys = matching(analysis, "go-concurrency.goroutine-id-state-key");
+  const asyncListeners = matching(analysis, "go-concurrency.async-listener.missing-shutdown");
   const prematureStateMarkers = matching(analysis, "go-concurrency.external-state-marker-before-success");
   const concurrentApiMissing = matching(analysis, "go-concurrency.concurrent-api.missing-test");
 
@@ -166,6 +167,16 @@ export async function reviewConcurrency(
     recommendation: "Pass request-scoped state or context through the interface and key ownership with an explicit request handle. If an upstream callback temporarily prevents that, isolate and document the compatibility shim and fail closed when identity parsing fails.",
   });
 
+  emitGroupedFinding(ctx, asyncListeners, {
+    title: "An asynchronously started HTTP listener has no shutdown owner",
+    category: "reliability",
+    severity: "medium",
+    summary: (count) => `${count} listener-backed server owner${count === 1 ? " starts" : "s start"} serving in a goroutine but expose no method that stops the owned HTTP server.`,
+    whyItMatters: "Start returns after launching Serve, so the listener and serving goroutine outlive the call. A deferred listener close inside that goroutine runs only after Serve exits and therefore cannot initiate shutdown.",
+    impact: "Daemon shutdown can leave the socket and serving goroutine alive, delaying termination and retaining resources across restart or test lifecycles.",
+    recommendation: "Give the lifecycle owner a Close or Shutdown method that forwards to the owned http.Server, and make the enclosing shutdown path invoke it.",
+  });
+
   emitGroupedFinding(ctx, prematureStateMarkers, {
     title: "Failed external work is recorded as completed local state",
     category: "correctness",
@@ -205,6 +216,7 @@ export async function reviewConcurrency(
   if (atomicCapacity.length > 0) staticSeverities.push("high");
   if (prematureStateMarkers.length > 0) staticSeverities.push("high");
   if (goroutineIDStateKeys.length > 0) staticSeverities.push("medium");
+  if (asyncListeners.length > 0) staticSeverities.push("medium");
   if (concurrentApiMissing.length > 0) staticSeverities.push("medium");
   const staticPrimaryConcern =
     deadlocks.length > 0 ? "local channel self-deadlocks" :
@@ -216,6 +228,7 @@ export async function reviewConcurrency(
     atomicCapacity.length > 0 ? "non-atomic capacity admission" :
     prematureStateMarkers.length > 0 ? "failed external work recorded as completed local state" :
     goroutineIDStateKeys.length > 0 ? "goroutine identifiers used as mutable state keys" :
+    asyncListeners.length > 0 ? "asynchronous HTTP listeners without shutdown ownership" :
     cancellation.length > 0 ? "discarded cancellation ownership" :
     detachedContexts.length > 0 ? "operations detached from caller cancellation" :
     storedContexts.length > 0 ? "context.Context stored on structs" :
@@ -254,6 +267,7 @@ export async function reviewConcurrency(
     atomicCapacity,
     prematureStateMarkers,
     goroutineIDStateKeys,
+    asyncListeners,
     concurrentApiMissing,
     ...(analysis.goVersion === undefined ? {} : { goVersion: analysis.goVersion }),
   });
@@ -355,6 +369,7 @@ function addAssessment(
     atomicCapacity: Signal[];
     prematureStateMarkers: Signal[];
     goroutineIDStateKeys: Signal[];
+    asyncListeners: Signal[];
     concurrentApiMissing: Signal[];
     goVersion?: GoVersion;
   },
@@ -455,6 +470,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would replace goroutine-derived state identity with explicit request-scoped ownership before merging.",
+    });
+    return;
+  }
+  if (groups.asyncListeners.length > 0) {
+    ctx.review.assessment({
+      risk: "medium",
+      summary: "A listener-backed HTTP server is started asynchronously without a lifecycle method that can stop the owned server.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would connect the asynchronous server to the daemon shutdown lifecycle before merging.",
     });
     return;
   }
