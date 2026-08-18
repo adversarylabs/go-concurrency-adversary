@@ -14,6 +14,7 @@ Review Go concurrency: lifecycle, cancellation, synchronization, races, and chan
 
 - Data races and shared mutable state without synchronization
 - Goroutine leaks; missing WaitGroup/errgroup joins
+- A type starts an asynchronous listener (`Serve` / `ListenAndServe`) and has no `Close`/`Shutdown` method, so the listener goroutine outlives daemon shutdown
 - WaitGroup completion paths that an early goroutine return can skip
 - Cancellation / context not propagated or ignored
 - `context.Context` stored on long-lived structs instead of passed as a parameter
