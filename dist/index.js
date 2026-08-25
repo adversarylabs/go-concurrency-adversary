@@ -3655,7 +3655,12 @@ var require_fast_uri = __commonJS({
     }
     function resolve3(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
-      const resolved = resolveComponent(parse(baseURI, schemelessOptions), parse(relativeURI, schemelessOptions), schemelessOptions, true);
+      const { parsed: baseParsed, malformedAuthorityOrPort: baseMalformed } = parseWithStatus(baseURI, schemelessOptions);
+      const { parsed: relativeParsed, malformedAuthorityOrPort: relativeMalformed } = parseWithStatus(relativeURI, schemelessOptions);
+      if (baseMalformed || relativeMalformed) {
+        throw new Error(baseParsed.error || relativeParsed.error || "URI is malformed.");
+      }
+      const resolved = resolveComponent(baseParsed, relativeParsed, schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
@@ -3781,6 +3786,7 @@ var require_fast_uri = __commonJS({
     }
     var URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u;
     var AUTHORITY_PREFIX = /^(?:[^#/:?]+:)?\/\/([^/?#]*)/;
+    var AUTHORITY_INTRODUCER_REGION = /^(?:[^#/:?]+:)?([/\\\t\n\r]*)/;
     function getParseError(parsed, matches) {
       if (matches[2] !== void 0 && parsed.path && parsed.path[0] !== "/") {
         return 'URI path must start with "/" when authority is present.';
@@ -3814,6 +3820,20 @@ var require_fast_uri = __commonJS({
       if (authorityMatch !== null && authorityMatch[1].indexOf("\\") !== -1) {
         parsed.error = "URI authority must not contain a literal backslash.";
         malformedAuthorityOrPort = true;
+      }
+      const introducerMatch = uri.match(AUTHORITY_INTRODUCER_REGION);
+      if (introducerMatch !== null) {
+        const region = introducerMatch[1];
+        const normalizedRegion = region.replace(/[\t\n\r]/g, "");
+        if (normalizedRegion.length >= 2) {
+          if (normalizedRegion.slice(0, 2) !== "//") {
+            parsed.error = parsed.error || "URI authority must not contain a literal backslash.";
+            malformedAuthorityOrPort = true;
+          } else if (region.length !== normalizedRegion.length) {
+            parsed.error = parsed.error || "URI authority introducer must not contain whitespace.";
+            malformedAuthorityOrPort = true;
+          }
+        }
       }
       const matches = uri.match(URI_PARSE);
       if (matches) {
@@ -21149,6 +21169,7 @@ async function analyzeFile(file) {
     analyzeGoroutineIDStateKeys(file, tree.rootNode, previousTree?.rootNode, aliases, signals);
     analyzePrematureExternalStateMarker(file, tree.rootNode, previousTree?.rootNode, signals);
     analyzeStoredContextFields(file, tree.rootNode, aliases, signals);
+    analyzeAsyncListenerMissingClose(file, tree.rootNode, signals);
     for (const fn of [
       ...descendants(tree.rootNode, "function_declaration"),
       ...descendants(tree.rootNode, "method_declaration")
@@ -23427,6 +23448,73 @@ function analyzeMissingSerializationTest(file, root, signals) {
     ));
   }
 }
+var ASYNC_LISTENER_CALLEES = /* @__PURE__ */ new Set(["Serve", "ListenAndServe", "ListenAndServeTLS"]);
+function analyzeAsyncListenerMissingClose(file, root, signals) {
+  if (file.path.endsWith("_test.go")) return;
+  const closerTypes = /* @__PURE__ */ new Set();
+  const serveByType = /* @__PURE__ */ new Map();
+  for (const method of descendants(root, "method_declaration")) {
+    const typeName = methodReceiverTypeName(method, file.current);
+    const methodName = functionNameOf(method, file.current);
+    if (typeName === void 0 || methodName === void 0) continue;
+    if (methodName === "Close" || methodName === "Shutdown") {
+      closerTypes.add(typeName);
+      continue;
+    }
+    const body2 = method.childForFieldName("body");
+    if (body2 === null) continue;
+    for (const call of descendants(body2, "call_expression")) {
+      const callee = callSelectorName(call, file.current);
+      if (callee === void 0 || !ASYNC_LISTENER_CALLEES.has(callee)) continue;
+      if (!isDiscardedCall(call)) continue;
+      const list = serveByType.get(typeName) ?? [];
+      list.push(call);
+      serveByType.set(typeName, list);
+    }
+  }
+  for (const [typeName, calls] of serveByType) {
+    if (closerTypes.has(typeName)) continue;
+    for (const call of calls) {
+      signals.push(signal(
+        file,
+        call,
+        "go-concurrency.async-listener.missing-close",
+        `${typeName} starts an asynchronous listener and has no Close or Shutdown method in this file.`,
+        { type: typeName, callee: callSelectorName(call, file.current) ?? "Serve" }
+      ));
+    }
+  }
+}
+function methodReceiverTypeName(fn, source) {
+  if (fn.type !== "method_declaration") return void 0;
+  const receiver = fn.childForFieldName("receiver");
+  if (receiver === null) return void 0;
+  const declaration = descendants(receiver, "parameter_declaration")[0];
+  const type = declaration?.childForFieldName("type");
+  if (type === void 0 || type === null) return void 0;
+  return sourceText(type, source).replace(/^\*+/, "").trim() || void 0;
+}
+function callSelectorName(call, source) {
+  const functionNode = call.childForFieldName("function");
+  if (functionNode === null) return void 0;
+  if (functionNode.type === "identifier") return sourceText(functionNode, source);
+  if (functionNode.type === "selector_expression") {
+    const field = functionNode.childForFieldName("field");
+    return field === null ? void 0 : sourceText(field, source);
+  }
+  return void 0;
+}
+function isDiscardedCall(call) {
+  let current = call.parent;
+  while (current !== null) {
+    if (current.type === "go_statement" || current.type === "expression_statement") return true;
+    if (current.type === "return_statement") return false;
+    if (current.type === "short_var_declaration" || current.type === "assignment_statement") return false;
+    if (current.type === "method_declaration" || current.type === "function_declaration") return false;
+    current = current.parent;
+  }
+  return false;
+}
 function signal(file, node, ruleId, message, data) {
   const line = node.startPosition.row + 1;
   return {
@@ -23932,6 +24020,7 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
   const goroutineIDStateKeys = matching(analysis, "go-concurrency.goroutine-id-state-key");
   const prematureStateMarkers = matching(analysis, "go-concurrency.external-state-marker-before-success");
   const concurrentApiMissing = matching(analysis, "go-concurrency.concurrent-api.missing-test");
+  const asyncListenerMissingClose = matching(analysis, "go-concurrency.async-listener.missing-close");
   emitGroupedFinding(ctx, deadlocks, {
     title: "A local unbuffered channel blocks before a peer can run",
     category: "correctness",
@@ -24076,6 +24165,15 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
     impact: "The caller sees the first failure, but a retry skips the external operation and can return success while the resource is still absent.",
     recommendation: "Return on the failed external operation, or write the local map entry only after success (including explicitly accepted already-exists outcomes)."
   });
+  emitGroupedFinding(ctx, asyncListenerMissingClose, {
+    title: "Async listener has no Close or Shutdown method",
+    category: "reliability",
+    severity: "high",
+    summary: (count) => `${count} type${count === 1 ? "" : "s"} start an asynchronous Serve/ListenAndServe and never implement Close or Shutdown in the same file.`,
+    whyItMatters: "A discarded Serve or ListenAndServe call starts a listener goroutine. Without Close or Shutdown on the owning type, daemon teardown cannot stop that goroutine or the socket.",
+    impact: "Shutdown leaks the listener goroutine and keeps the port bound, so later starts fail or the process cannot exit cleanly.",
+    recommendation: "Add Close or Shutdown on the type that starts the listener and stop the server from that method. Return the Serve error when the call is meant to be blocking."
+  });
   emitGroupedFinding(ctx, concurrentApiMissing, {
     title: "Concurrent API guarantee lacks test for overlapping calls",
     category: "correctness",
@@ -24104,7 +24202,8 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
   if (prematureStateMarkers.length > 0) staticSeverities.push("high");
   if (goroutineIDStateKeys.length > 0) staticSeverities.push("medium");
   if (concurrentApiMissing.length > 0) staticSeverities.push("medium");
-  const staticPrimaryConcern = deadlocks.length > 0 ? "local channel self-deadlocks" : mutexCopy.length > 0 ? "copied mutex values" : waitGroups.length > 0 ? "WaitGroup registration races" : waitGroupCompletion.length > 0 ? "skippable WaitGroup completion" : waitGroupCopied.length > 0 ? "WaitGroup value copies" : loopVars.length > 0 ? "loop variable captures in goroutines" : atomicCapacity.length > 0 ? "non-atomic capacity admission" : prematureStateMarkers.length > 0 ? "failed external work recorded as completed local state" : goroutineIDStateKeys.length > 0 ? "goroutine identifiers used as mutable state keys" : cancellation.length > 0 ? "discarded cancellation ownership" : detachedContexts.length > 0 ? "operations detached from caller cancellation" : storedContexts.length > 0 ? "context.Context stored on structs" : cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" : selectBusy.length > 0 ? "busy-spinning select defaults" : tickers.length > 0 ? "tickers without Stop" : timers.length > 0 ? "time.After inside loops" : concurrentApiMissing.length > 0 ? "missing tests for concurrent API serialization" : void 0;
+  if (asyncListenerMissingClose.length > 0) staticSeverities.push("high");
+  const staticPrimaryConcern = deadlocks.length > 0 ? "local channel self-deadlocks" : mutexCopy.length > 0 ? "copied mutex values" : waitGroups.length > 0 ? "WaitGroup registration races" : waitGroupCompletion.length > 0 ? "skippable WaitGroup completion" : waitGroupCopied.length > 0 ? "WaitGroup value copies" : loopVars.length > 0 ? "loop variable captures in goroutines" : atomicCapacity.length > 0 ? "non-atomic capacity admission" : prematureStateMarkers.length > 0 ? "failed external work recorded as completed local state" : goroutineIDStateKeys.length > 0 ? "goroutine identifiers used as mutable state keys" : cancellation.length > 0 ? "discarded cancellation ownership" : detachedContexts.length > 0 ? "operations detached from caller cancellation" : storedContexts.length > 0 ? "context.Context stored on structs" : cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" : selectBusy.length > 0 ? "busy-spinning select defaults" : tickers.length > 0 ? "tickers without Stop" : timers.length > 0 ? "time.After inside loops" : concurrentApiMissing.length > 0 ? "missing tests for concurrent API serialization" : asyncListenerMissingClose.length > 0 ? "async listeners without Close or Shutdown" : void 0;
   await attachImportNavigation(ctx, analysis);
   const modelStatus = await runModelConcurrencyReview(
     ctx,
@@ -24134,6 +24233,7 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
     prematureStateMarkers,
     goroutineIDStateKeys,
     concurrentApiMissing,
+    asyncListenerMissingClose,
     ...analysis.goVersion === void 0 ? {} : { goVersion: analysis.goVersion }
   });
 }
@@ -24377,6 +24477,17 @@ function addAssessment(ctx, groups) {
     ctx.review.opinion({
       ship: false,
       summary: "I would add active-call counter or max-concurrency assertion inside the test harness before merging."
+    });
+    return;
+  }
+  if (groups.asyncListenerMissingClose.length > 0) {
+    ctx.review.assessment({
+      risk: "high",
+      summary: "A type starts an asynchronous listener and has no Close or Shutdown method, so the listener goroutine can outlive daemon shutdown."
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would add Close or Shutdown on the type that starts the listener before merging."
     });
     return;
   }

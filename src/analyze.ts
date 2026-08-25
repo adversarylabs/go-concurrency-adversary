@@ -41,6 +41,7 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
     analyzeGoroutineIDStateKeys(file, tree.rootNode, previousTree?.rootNode, aliases, signals);
     analyzePrematureExternalStateMarker(file, tree.rootNode, previousTree?.rootNode, signals);
     analyzeStoredContextFields(file, tree.rootNode, aliases, signals);
+    analyzeAsyncListenerMissingClose(file, tree.rootNode, signals);
     for (const fn of [
       ...descendants(tree.rootNode, "function_declaration"),
       ...descendants(tree.rootNode, "method_declaration"),
@@ -2823,6 +2824,87 @@ function analyzeMissingSerializationTest(file: SourceRevision, root: Node, signa
       "Test races concurrent calls to lifecycle API (Export/ForceFlush/Shutdown-style) but lacks active-call counter or max-concurrency assertion proving the serialization guarantee.",
       { form: "missing-serialization-test" }));
   }
+}
+
+const ASYNC_LISTENER_CALLEES = new Set(["Serve", "ListenAndServe", "ListenAndServeTLS"]);
+
+/**
+ * A method starts Serve/ListenAndServe as a discarded statement (fire-and-forget
+ * or documented-async helper) and the receiver type has no Close/Shutdown in
+ * this file. That leaves the listener goroutine and socket running after the
+ * owner is dropped.
+ */
+function analyzeAsyncListenerMissingClose(file: SourceRevision, root: Node, signals: Signal[]): void {
+  if (file.path.endsWith("_test.go")) return;
+
+  const closerTypes = new Set<string>();
+  const serveByType = new Map<string, Node[]>();
+
+  for (const method of descendants(root, "method_declaration")) {
+    const typeName = methodReceiverTypeName(method, file.current);
+    const methodName = functionNameOf(method, file.current);
+    if (typeName === undefined || methodName === undefined) continue;
+    if (methodName === "Close" || methodName === "Shutdown") {
+      closerTypes.add(typeName);
+      continue;
+    }
+    const body = method.childForFieldName("body");
+    if (body === null) continue;
+    for (const call of descendants(body, "call_expression")) {
+      const callee = callSelectorName(call, file.current);
+      if (callee === undefined || !ASYNC_LISTENER_CALLEES.has(callee)) continue;
+      if (!isDiscardedCall(call)) continue;
+      const list = serveByType.get(typeName) ?? [];
+      list.push(call);
+      serveByType.set(typeName, list);
+    }
+  }
+
+  for (const [typeName, calls] of serveByType) {
+    if (closerTypes.has(typeName)) continue;
+    for (const call of calls) {
+      signals.push(signal(
+        file,
+        call,
+        "go-concurrency.async-listener.missing-close",
+        `${typeName} starts an asynchronous listener and has no Close or Shutdown method in this file.`,
+        { type: typeName, callee: callSelectorName(call, file.current) ?? "Serve" },
+      ));
+    }
+  }
+}
+
+function methodReceiverTypeName(fn: Node, source: string): string | undefined {
+  if (fn.type !== "method_declaration") return undefined;
+  const receiver = fn.childForFieldName("receiver");
+  if (receiver === null) return undefined;
+  const declaration = descendants(receiver, "parameter_declaration")[0];
+  const type = declaration?.childForFieldName("type");
+  if (type === undefined || type === null) return undefined;
+  return sourceText(type, source).replace(/^\*+/, "").trim() || undefined;
+}
+
+function callSelectorName(call: Node, source: string): string | undefined {
+  const functionNode = call.childForFieldName("function");
+  if (functionNode === null) return undefined;
+  if (functionNode.type === "identifier") return sourceText(functionNode, source);
+  if (functionNode.type === "selector_expression") {
+    const field = functionNode.childForFieldName("field");
+    return field === null ? undefined : sourceText(field, source);
+  }
+  return undefined;
+}
+
+function isDiscardedCall(call: Node): boolean {
+  let current: Node | null = call.parent;
+  while (current !== null) {
+    if (current.type === "go_statement" || current.type === "expression_statement") return true;
+    if (current.type === "return_statement") return false;
+    if (current.type === "short_var_declaration" || current.type === "assignment_statement") return false;
+    if (current.type === "method_declaration" || current.type === "function_declaration") return false;
+    current = current.parent;
+  }
+  return false;
 }
 
 function signal(

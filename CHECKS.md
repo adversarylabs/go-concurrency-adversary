@@ -2,6 +2,7 @@
 
 | Rule | Severity | Scans for |
 | --- | --- | --- |
+| `go-concurrency.async-listener.missing-close` | High | A type starts an async `Serve`/`ListenAndServe` and has no `Close`/`Shutdown` |
 | `go-concurrency.atomic-capacity-check-update` | High | Capacity is checked and reserved in separate atomic operations |
 | `go-concurrency.cancellation-owned` | Medium | Concurrent work lacks cancellation ownership |
 | `go-concurrency.channel.self-deadlock` | High | Channel self-deadlock pattern |
