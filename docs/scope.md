@@ -14,7 +14,7 @@ Review Go concurrency: lifecycle, cancellation, synchronization, races, and chan
 
 - Data races and shared mutable state without synchronization
 - Goroutine leaks; missing WaitGroup/errgroup joins
-- A type starts an asynchronous listener (`Serve` / `ListenAndServe`) and has no `Close`/`Shutdown` method, so the listener goroutine outlives daemon shutdown
+- A type starts `Serve` / `ListenAndServe` in an explicit goroutine, or passes a listener created by an unshadowed standard-library `net.Listen` call and its owned `*http.Server.Serve` callback at the helper's exact parameter positions to a reachable, module-qualified local helper whose body proves that callback runs in a goroutine, but exposes no reachable field-bound `Close`/`Shutdown`/`Stop` mechanism. A definitely active listener stop that can initiate shutdown is accepted; conditional cleanup or a close reachable only after blocking `Serve` returns is not. Missing module identity, unresolved imports, dead code, shadowed or reassigned bindings, unproven helper names, synchronous helpers, tests, and process-lifetime `main` packages are excluded.
 - WaitGroup completion paths that an early goroutine return can skip
 - Cancellation / context not propagated or ignored
 - `context.Context` stored on long-lived structs instead of passed as a parameter

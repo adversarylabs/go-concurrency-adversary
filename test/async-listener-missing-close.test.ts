@@ -7,7 +7,7 @@ import { createApp } from "../src/index.ts";
 
 const ruleId = "go-concurrency.async-listener.missing-close";
 
-test("flags discarded Serve on a type without Close", async () => {
+test("stays quiet for an unproven helper merely named Serve", async () => {
   const output = await review(await repository({
     "plugin.go": `package sample
 
@@ -35,11 +35,7 @@ var internal = struct {
 }{}
 `,
   }));
-  const finding = output.findings.find((item) => item.ruleId === ruleId);
-  assert.ok(finding);
-  assert.equal(finding.severity, "high");
-  assert.match(finding.title ?? "", /async listener/i);
-  assert.ok(finding.evidence.some((item) => item.location?.file === "plugin.go"));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
 });
 
 test("flags go ListenAndServe without Close", async () => {
@@ -60,36 +56,24 @@ func (d *debug) Start() {
   assert.ok(finding.evidence.some((item) => item.location?.file === "http.go"));
 });
 
-test("stays quiet when the type implements Close", async () => {
+test("stays quiet when a direct goroutine owner implements Close", async () => {
   const output = await review(await repository({
     "plugin.go": `package sample
 
-import (
-	"context"
-	"net"
-	"net/http"
-)
+import "net/http"
 
 type server struct {
 	handler *http.Server
 }
 
-func (s server) Start(ctx context.Context) error {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	internal.Serve(ctx, l, s.handler.Serve)
-	return nil
+func (s server) Start() {
+	go s.handler.ListenAndServe()
 }
 
 func (s server) Close() error {
 	return s.handler.Close()
 }
 
-var internal = struct {
-	Serve func(context.Context, net.Listener, func(net.Listener) error)
-}{}
 `,
   }));
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);

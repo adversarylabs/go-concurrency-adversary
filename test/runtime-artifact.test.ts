@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,19 +16,32 @@ test("the published runtime executes without node_modules", async () => {
   const entrypoint = join(artifact, "dist", "index.js");
   const input = join(artifact, "input.json");
   const output = join(artifact, "output.json");
+  const archive = join(artifact, "package.tar");
 
-  await mkdir(dirname(entrypoint), { recursive: true });
-  await mkdir(join(artifact, "schemas"), { recursive: true });
-  await copyFile(join(projectRoot, "dist", "index.js"), entrypoint);
-  await copyFile(join(projectRoot, "dist", "web-tree-sitter.wasm"), join(artifact, "dist", "web-tree-sitter.wasm"));
-  await copyFile(join(projectRoot, "dist", "tree-sitter-go.wasm"), join(artifact, "dist", "tree-sitter-go.wasm"));
-  await copyFile(
-    join(projectRoot, "schemas", "adversary.review.v1.schema.json"),
-    join(artifact, "schemas", "adversary.review.v1.schema.json"),
-  );
-  await copyFile(join(projectRoot, "THIRD_PARTY_NOTICES.md"), join(artifact, "THIRD_PARTY_NOTICES.md"));
-  await writeFile(join(artifact, "package.json"), '{"type":"module"}\n');
+  const ignored = (await readFile(join(projectRoot, ".adversaryignore"), "utf8"))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  assert.ok(ignored.includes(".git"));
+
+  for (const path of ["dist/web-tree-sitter.wasm", "dist/tree-sitter-go.wasm"]) {
+    await execute("git", ["ls-files", "--error-unmatch", path], { cwd: projectRoot });
+  }
+  await execute("git", [
+    "archive",
+    "--format=tar",
+    `--output=${archive}`,
+    "HEAD",
+    "dist/index.js",
+    "dist/web-tree-sitter.wasm",
+    "dist/tree-sitter-go.wasm",
+    "schemas/adversary.review.v1.schema.json",
+    "THIRD_PARTY_NOTICES.md",
+    "package.json",
+  ], { cwd: projectRoot });
+  await execute("tar", ["-xf", archive, "-C", artifact]);
   await writeFile(join(repository, "main.go"), "package sample\n\nfunc ready() bool { return true }\n");
+  await writeFile(join(repository, "go.mod"), "module example.com/project\n\ngo 1.24\n");
   await writeFile(input, `${JSON.stringify({ source: { path: repository } })}\n`);
 
   const bundle = await readFile(entrypoint, "utf8");
@@ -61,6 +74,56 @@ test("the published runtime executes without node_modules", async () => {
   const envelope = JSON.parse(await readFile(output, "utf8"));
   assert.equal(envelope.protocolVersion, 1);
   assert.equal(envelope.result.adversary.name, "go-concurrency");
-  assert.equal(envelope.result.adversary.version, "0.0.21");
+  assert.equal(envelope.result.adversary.version, "0.0.24");
   assert.deepEqual(envelope.result.findings, []);
+
+  await mkdir(join(repository, "plugins/server/internal"), { recursive: true });
+  await mkdir(join(repository, "plugins/server/debug"), { recursive: true });
+  await writeFile(join(repository, "plugins/server/internal/serve.go"), `package internal
+
+import "net"
+
+func Serve(listener net.Listener, serve func(net.Listener) error) {
+  go func() {
+    defer listener.Close()
+    _ = serve(listener)
+  }()
+}
+`);
+  await writeFile(join(repository, "plugins/server/debug/plugin.go"), `package debug
+
+import (
+  "context"
+  "net"
+  "net/http"
+  "example.com/project/plugins/server/internal"
+)
+
+type server struct { handler *http.Server }
+
+func (s server) Start(ctx context.Context) error {
+  listener, err := net.Listen("tcp", ":0")
+  if err != nil { return err }
+  internal.Serve(listener, s.handler.Serve)
+  return nil
+}
+`);
+
+  await execute(process.execPath, [entrypoint], {
+    cwd: artifact,
+    env: {
+      ...process.env,
+      ADVERSARY_INPUT: input,
+      ADVERSARY_OUTPUT: output,
+      ADVERSARY_REPO: repository,
+    },
+  });
+  const detectorEnvelope = JSON.parse(await readFile(output, "utf8"));
+  assert.equal(detectorEnvelope.result.adversary.version, "0.0.24");
+  assert.equal(
+    detectorEnvelope.result.findings.filter(
+      (finding: { ruleId?: string }) => finding.ruleId === "go-concurrency.async-listener.missing-close",
+    ).length,
+    1,
+  );
 });

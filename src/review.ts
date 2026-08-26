@@ -182,9 +182,9 @@ export async function reviewConcurrency(
     category: "reliability",
     severity: "high",
     summary: (count) =>
-      `${count} type${count === 1 ? "" : "s"} start an asynchronous Serve/ListenAndServe and never implement Close or Shutdown in the same file.`,
+      `${count} type${count === 1 ? "" : "s"} start a proven asynchronous Serve/ListenAndServe path and expose no Close or Shutdown mechanism.`,
     whyItMatters:
-      "A discarded Serve or ListenAndServe call starts a listener goroutine. Without Close or Shutdown on the owning type, daemon teardown cannot stop that goroutine or the socket.",
+      "A direct goroutine launch or locally proven helper starts serving after Start returns. Without Close or Shutdown on the owning type, daemon teardown cannot stop that goroutine or the socket.",
     impact:
       "Shutdown leaks the listener goroutine and keeps the port bound, so later starts fail or the process cannot exit cleanly.",
     recommendation:

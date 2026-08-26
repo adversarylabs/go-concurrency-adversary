@@ -2,7 +2,7 @@
 
 | Rule | Severity | Scans for |
 | --- | --- | --- |
-| `go-concurrency.async-listener.missing-close` | High | A type starts an async `Serve`/`ListenAndServe` and has no `Close`/`Shutdown` |
+| `go-concurrency.async-listener.missing-close` | High | A type starts `Serve`/`ListenAndServe` in a direct goroutine, or passes a listener created by unshadowed standard-library `net.Listen` and its owned `*http.Server.Serve` callback at the exact parameter positions of a reachable, module-qualified local async helper, but has no reachable field-bound `Close`/`Shutdown`/`Stop` mechanism; unresolved, dead, shadowed, or reassigned relationships, synchronous helpers, process-lifetime `main`, tests, and helpers with a definitely active initiating listener-stop path stay quiet, while conditional or post-`Serve` cleanup does not count as shutdown ownership |
 | `go-concurrency.atomic-capacity-check-update` | High | Capacity is checked and reserved in separate atomic operations |
 | `go-concurrency.cancellation-owned` | Medium | Concurrent work lacks cancellation ownership |
 | `go-concurrency.channel.self-deadlock` | High | Channel self-deadlock pattern |
