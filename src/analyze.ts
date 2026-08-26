@@ -2830,10 +2830,10 @@ function analyzeMissingSerializationTest(file: SourceRevision, root: Node, signa
 const ASYNC_LISTENER_CALLEES = new Set(["Serve", "ListenAndServe", "ListenAndServeTLS"]);
 
 /**
- * A method starts Serve/ListenAndServe as a discarded statement (fire-and-forget
- * or documented-async helper) and the receiver type has no Close/Shutdown in
- * this file. That leaves the listener goroutine and socket running after the
- * owner is dropped.
+ * A method starts Serve/ListenAndServe in an explicit go statement and the
+ * receiver type has no Close/Shutdown in this file. Locally proven async helper
+ * calls are handled by the program-level ownership pass instead of relying on
+ * method names alone.
  */
 function analyzeAsyncListenerMissingClose(file: SourceRevision, root: Node, signals: Signal[]): void {
   if (file.path.endsWith("_test.go")) return;
@@ -2854,7 +2854,7 @@ function analyzeAsyncListenerMissingClose(file: SourceRevision, root: Node, sign
     for (const call of descendants(body, "call_expression")) {
       const callee = callSelectorName(call, file.current);
       if (callee === undefined || !ASYNC_LISTENER_CALLEES.has(callee)) continue;
-      if (!isDiscardedCall(call)) continue;
+      if (!isGoCall(call)) continue;
       const list = serveByType.get(typeName) ?? [];
       list.push(call);
       serveByType.set(typeName, list);
@@ -2873,6 +2873,17 @@ function analyzeAsyncListenerMissingClose(file: SourceRevision, root: Node, sign
       ));
     }
   }
+}
+
+function isGoCall(call: Node): boolean {
+  let current: Node | null = call.parent;
+  while (current !== null) {
+    if (current.type === "go_statement") return true;
+    if (current.type === "func_literal" || current.type === "function_declaration" ||
+        current.type === "method_declaration") return false;
+    current = current.parent;
+  }
+  return false;
 }
 
 function methodReceiverTypeName(fn: Node, source: string): string | undefined {
@@ -2894,18 +2905,6 @@ function callSelectorName(call: Node, source: string): string | undefined {
     return field === null ? undefined : sourceText(field, source);
   }
   return undefined;
-}
-
-function isDiscardedCall(call: Node): boolean {
-  let current: Node | null = call.parent;
-  while (current !== null) {
-    if (current.type === "go_statement" || current.type === "expression_statement") return true;
-    if (current.type === "return_statement") return false;
-    if (current.type === "short_var_declaration" || current.type === "assignment_statement") return false;
-    if (current.type === "method_declaration" || current.type === "function_declaration") return false;
-    current = current.parent;
-  }
-  return false;
 }
 
 function signal(

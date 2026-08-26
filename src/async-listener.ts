@@ -86,7 +86,7 @@ async function parseRelevantFiles(files: SourceRevision[], previous: boolean): P
     if (previous && file.status === "added" && file.previous === undefined) continue;
     const source = previous ? (file.previous ?? file.current) : file.current;
     // Avoid reparsing the whole repository for a deliberately rare rule.
-    if (!/(?:net\/http|net\b|\.Serve\b|go\s+func|func\s+\w+\s*\()/.test(source)) continue;
+    if (!/(?:net\/http|net\b|\.Serve\b|go\s+func|func\s*(?:\([^)]*\)\s*)?\w+\s*\()/.test(source)) continue;
     try {
       const tree = await parseGo(source);
       if (tree.rootNode.hasError) {
@@ -213,9 +213,9 @@ function collectAsyncHelpers(parsed: ParsedFile): AsyncListenerHelper[] {
     const listenerName = listener === undefined ? undefined : declaredNames(listener, source)[0];
     const callbackName = callback === undefined ? undefined : declaredNames(callback, source)[0];
     if (listenerName === undefined || callbackName === undefined) continue;
-    // A helper that observes cancellation or owns another shutdown path is not
-    // evidence that the wrapper itself leaks.
-    if (containsCancellationOrShutdown(body, source, listenerName)) continue;
+    // A helper that directly stops the listener owns shutdown itself. Merely
+    // observing cancellation does not release the listener or serving goroutine.
+    if (helperStopsListener(body, source, listenerName)) continue;
 
     for (const goStatement of directCallableDescendants(body, "go_statement")) {
       const invocation = goStatement.namedChildren.find((node) => node.type === "call_expression");
@@ -318,6 +318,7 @@ function methodStopsField(method: Node, source: string, fieldName: string): bool
   // ownership question; this rule is specifically for the complete absence of
   // a stop mechanism.
   return descendants(body, "call_expression").some((call) => {
+    if (!callIsDefinitelyActive(call, body)) return false;
     const fn = call.childForFieldName("function");
     if (fn?.type !== "selector_expression") return false;
     const operand = fn.childForFieldName("operand");
@@ -330,20 +331,38 @@ function methodStopsField(method: Node, source: string, fieldName: string): bool
   });
 }
 
-function containsCancellationOrShutdown(body: Node, source: string, listenerName: string): boolean {
+function helperStopsListener(body: Node, source: string, listenerName: string): boolean {
   return descendants(body, "call_expression").some((call) => {
+    if (!callIsDefinitelyActive(call, body)) return false;
     const fn = call.childForFieldName("function");
     if (fn?.type !== "selector_expression") return false;
     const operand = fn.childForFieldName("operand");
     const field = fn.childForFieldName("field");
-    if (operand === null || field === null) return false;
+    if (operand?.type !== "identifier" || field === null || sourceText(operand, source) !== listenerName) return false;
     const selected = sourceText(field, source);
-    if (selected === "Done") return true;
     if (!/^(?:Close|Shutdown|Stop)$/.test(selected)) return false;
     // The exact helper defers listener.Close inside the serving goroutine. That
     // releases the socket only after Serve returns; it is not a stop path.
-    return !(sourceText(operand, source) === listenerName && insideDeferStatement(call));
+    return !insideDeferStatement(call);
   });
+}
+
+function callIsDefinitelyActive(call: Node, callableBody: Node): boolean {
+  let current: Node | null = call.parent;
+  while (current !== null && current.id !== callableBody.id) {
+    if (current.type === "func_literal") {
+      const invocation = current.parent;
+      if (invocation?.type !== "call_expression" || invocation.childForFieldName("function")?.id !== current.id) {
+        return false;
+      }
+      const execution = invocation.parent;
+      if (execution?.type !== "go_statement" && execution?.type !== "expression_statement") return false;
+      current = execution.parent;
+      continue;
+    }
+    current = current.parent;
+  }
+  return current?.id === callableBody.id;
 }
 
 function defersListenerClose(body: Node, source: string, listenerName: string): boolean {
@@ -489,7 +508,7 @@ function changedEvidence(mode: Discovery["mode"], file: SourceRevision, node: No
 function makeSignal(file: SourceRevision, node: Node, fact: AsyncListenerFact): Signal {
   const line = node.startPosition.row + 1;
   return {
-    ruleId: "go-concurrency.async-listener.missing-shutdown",
+    ruleId: "go-concurrency.async-listener.missing-close",
     path: file.path,
     line,
     ...(node.endPosition.row > node.startPosition.row ? { endLine: node.endPosition.row + 1 } : {}),

@@ -8,18 +8,18 @@ import test from "node:test";
 import { createApp } from "../src/index.ts";
 
 const execute = promisify(execFile);
-const ruleId = "go-concurrency.async-listener.missing-shutdown";
+const ruleId = "go-concurrency.async-listener.missing-close";
 
 test("flags the containerd-shaped async listener wrapper without shutdown ownership", async () => {
   const output = await review(await repository(vulnerableProject()));
   const finding = output.findings.find((item) => item.ruleId === ruleId);
 
-  assert.equal(finding?.severity, "medium");
+  assert.equal(finding?.severity, "high");
   assert.equal(finding?.confidence, "high");
   assert.equal(finding?.evidence.length, 1);
   assert.equal(finding?.evidence[0]?.location?.file, "plugins/server/debug/plugin.go");
-  assert.match(finding?.title ?? "", /no shutdown owner/i);
-  assert.match(finding?.whyItMatters ?? "", /Serve exits/i);
+  assert.match(finding?.title ?? "", /async listener/i);
+  assert.match(finding?.whyItMatters ?? "", /serv|listener/i);
   assert.match(finding?.recommendation ?? "", /Close or Shutdown/i);
 });
 
@@ -34,12 +34,50 @@ func (s server) Close() error {
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
 });
 
-test("accepts an explicit cancellation shutdown path and a one-step server alias", async () => {
+test("accepts an exact field-bound Close method in another owner file", async () => {
+  const files = vulnerableProject();
+  files["plugins/server/debug/close.go"] = `package debug
+
+func (s server) Close() error { return s.handler.Close() }
+`;
+  const output = await review(await repository(files));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
+test("does not accept unrelated or uninvoked shutdown-looking calls", async () => {
+  const unrelated = vulnerableProject();
+  unrelated["plugins/server/debug/plugin.go"] += `
+type metricsSink struct{}
+func (*metricsSink) Close() error { return nil }
+func (s server) CloseMetrics(metrics *metricsSink) error { return metrics.Close() }
+`;
+  const stored = vulnerableProject();
+  stored["plugins/server/debug/plugin.go"] += `
+func (s server) CloseLater() error {
+  cleanup := func() { _ = s.handler.Close() }
+  _ = cleanup
+  return nil
+}
+`;
+  for (const files of [unrelated, stored]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+  }
+});
+
+test("requires the imported helper to resolve to the proven package", async () => {
+  const files = vulnerableProject();
+  files["plugins/server/debug/plugin.go"] = files["plugins/server/debug/plugin.go"]!
+    .replace('"example.com/project/plugins/server/internal"', 'internal "example.com/project/other/internal"');
+  const output = await review(await repository(files));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
+test("accepts an explicit listener stop path and a one-step server alias", async () => {
   const direct = vulnerableProject();
-  direct["plugins/server/debug/plugin.go"] = direct["plugins/server/debug/plugin.go"]!.replace(
-    "  internal.Serve(ctx, listener, s.handler.Serve)",
-    `  internal.Serve(ctx, listener, s.handler.Serve)
-  go func() { <-ctx.Done(); _ = s.handler.Close() }()`,
+  direct["plugins/server/internal/serve.go"] = direct["plugins/server/internal/serve.go"]!.replace(
+    "  _ = ctx",
+    "  go func() { <-ctx.Done(); _ = listener.Close() }()",
   );
   const alias = vulnerableProject();
   alias["plugins/server/debug/plugin.go"] += `
@@ -67,15 +105,16 @@ type fakeServer struct{}
 func (*fakeServer) Serve(net.Listener) error { return nil }
 `;
 
-  const cancellationAware = vulnerableProject();
-  cancellationAware["plugins/server/internal/serve.go"] = cancellationAware["plugins/server/internal/serve.go"]!
-    .replace("  _ = ctx", "  <-ctx.Done()")
-    .replace("  go func() {", "  go func() {");
+  const unrelatedDone = vulnerableProject();
+  unrelatedDone["plugins/server/internal/serve.go"] = unrelatedDone["plugins/server/internal/serve.go"]!
+    .replace("  _ = ctx", "  <-ctx.Done()");
 
-  for (const files of [synchronous, fake, cancellationAware]) {
+  for (const files of [synchronous, fake]) {
     const output = await review(await repository(files));
     assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
   }
+  const stillUnsafe = await review(await repository(unrelatedDone));
+  assert.equal(stillUnsafe.findings.some((item) => item.ruleId === ruleId), true);
 });
 
 test("stays quiet for a process-lifetime main package server", async () => {

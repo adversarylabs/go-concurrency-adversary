@@ -61,6 +61,56 @@ test("the published runtime executes without node_modules", async () => {
   const envelope = JSON.parse(await readFile(output, "utf8"));
   assert.equal(envelope.protocolVersion, 1);
   assert.equal(envelope.result.adversary.name, "go-concurrency");
-  assert.equal(envelope.result.adversary.version, "0.0.21");
+  assert.equal(envelope.result.adversary.version, "0.0.24");
   assert.deepEqual(envelope.result.findings, []);
+
+  await mkdir(join(repository, "plugins/server/internal"), { recursive: true });
+  await mkdir(join(repository, "plugins/server/debug"), { recursive: true });
+  await writeFile(join(repository, "plugins/server/internal/serve.go"), `package internal
+
+import "net"
+
+func Serve(listener net.Listener, serve func(net.Listener) error) {
+  go func() {
+    defer listener.Close()
+    _ = serve(listener)
+  }()
+}
+`);
+  await writeFile(join(repository, "plugins/server/debug/plugin.go"), `package debug
+
+import (
+  "context"
+  "net"
+  "net/http"
+  "example.com/project/plugins/server/internal"
+)
+
+type server struct { handler *http.Server }
+
+func (s server) Start(ctx context.Context) error {
+  listener, err := net.Listen("tcp", ":0")
+  if err != nil { return err }
+  internal.Serve(listener, s.handler.Serve)
+  return nil
+}
+`);
+
+  await execute(process.execPath, [entrypoint], {
+    cwd: artifact,
+    env: {
+      ...process.env,
+      ADVERSARY_INPUT: input,
+      ADVERSARY_OUTPUT: output,
+      ADVERSARY_REPO: repository,
+    },
+  });
+  const detectorEnvelope = JSON.parse(await readFile(output, "utf8"));
+  assert.equal(detectorEnvelope.result.adversary.version, "0.0.24");
+  assert.equal(
+    detectorEnvelope.result.findings.filter(
+      (finding: { ruleId?: string }) => finding.ruleId === "go-concurrency.async-listener.missing-close",
+    ).length,
+    1,
+  );
 });
