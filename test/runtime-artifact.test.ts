@@ -23,8 +23,18 @@ test("the published runtime executes without node_modules", async () => {
     .map((line) => line.trim())
     .filter(Boolean);
   assert.ok(ignored.includes(".git"));
+  assert.ok(ignored.includes("node_modules/"));
 
-  for (const path of ["dist/web-tree-sitter.wasm", "dist/tree-sitter-go.wasm"]) {
+  const runtimeFiles = [
+    "adversary.yaml",
+    "dist/index.js",
+    "dist/web-tree-sitter.wasm",
+    "dist/tree-sitter-go.wasm",
+    "schemas/adversary.review.v1.schema.json",
+    "THIRD_PARTY_NOTICES.md",
+    "package.json",
+  ];
+  for (const path of runtimeFiles) {
     await execute("git", ["ls-files", "--error-unmatch", path], { cwd: projectRoot });
   }
   await execute("git", [
@@ -32,13 +42,15 @@ test("the published runtime executes without node_modules", async () => {
     "--format=tar",
     `--output=${archive}`,
     "HEAD",
-    "dist/index.js",
-    "dist/web-tree-sitter.wasm",
-    "dist/tree-sitter-go.wasm",
-    "schemas/adversary.review.v1.schema.json",
-    "THIRD_PARTY_NOTICES.md",
-    "package.json",
+    ...runtimeFiles,
   ], { cwd: projectRoot });
+  const { stdout: archiveListing } = await execute("tar", ["-tf", archive]);
+  const archivePaths = archiveListing.split(/\r?\n/).filter(Boolean);
+  assert.ok(archivePaths.length >= runtimeFiles.length);
+  for (const path of archivePaths) {
+    assert.equal(path.split("/").includes("node_modules"), false, `${path} must not ship`);
+    assert.equal(path.split("/").includes(".git"), false, `${path} must not ship`);
+  }
   await execute("tar", ["-xf", archive, "-C", artifact]);
   await writeFile(join(repository, "main.go"), "package sample\n\nfunc ready() bool { return true }\n");
   await writeFile(join(repository, "go.mod"), "module example.com/project\n\ngo 1.24\n");
@@ -46,6 +58,10 @@ test("the published runtime executes without node_modules", async () => {
 
   const bundle = await readFile(entrypoint, "utf8");
   assert.doesNotMatch(bundle, /from\s+["'](?:@adversarylabs\/sdk|web-tree-sitter)["']/);
+  for (const path of runtimeFiles.filter((path) => !path.endsWith(".wasm"))) {
+    const content = await readFile(join(artifact, path), "utf8");
+    assert.doesNotMatch(content, /\/Users\/[^/\s]+|\/private\/tmp\/|[A-Za-z]:\\Users\\/);
+  }
   const notices = await readFile(join(artifact, "THIRD_PARTY_NOTICES.md"), "utf8");
   assert.deepEqual([...notices.matchAll(/^## (.+?) \(/gm)].map((match) => match[1]), [
     "@adversarylabs/sdk",
@@ -74,7 +90,7 @@ test("the published runtime executes without node_modules", async () => {
   const envelope = JSON.parse(await readFile(output, "utf8"));
   assert.equal(envelope.protocolVersion, 1);
   assert.equal(envelope.result.adversary.name, "go-concurrency");
-  assert.equal(envelope.result.adversary.version, "0.0.24");
+  assert.equal(envelope.result.adversary.version, "0.0.25");
   assert.deepEqual(envelope.result.findings, []);
 
   await mkdir(join(repository, "plugins/server/internal"), { recursive: true });
@@ -119,7 +135,7 @@ func (s server) Start(ctx context.Context) error {
     },
   });
   const detectorEnvelope = JSON.parse(await readFile(output, "utf8"));
-  assert.equal(detectorEnvelope.result.adversary.version, "0.0.24");
+  assert.equal(detectorEnvelope.result.adversary.version, "0.0.25");
   assert.equal(
     detectorEnvelope.result.findings.filter(
       (finding: { ruleId?: string }) => finding.ruleId === "go-concurrency.async-listener.missing-close",

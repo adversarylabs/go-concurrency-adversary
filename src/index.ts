@@ -10,7 +10,7 @@ import { reviewConcurrency } from "./review.js";
 export function createApp(): Adversary {
   const app = new Adversary({
     name: "go-concurrency",
-    version: "0.0.24",
+    version: "0.0.25",
     review: { maximumFindings: 5, minimumConfidence: "medium" },
   });
 
