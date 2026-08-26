@@ -21624,17 +21624,102 @@ function directStatements(node) {
   const list = node.namedChildren.find((child) => child.type === "statement_list");
   return list?.namedChildren ?? (node.type === "block" || node.type.endsWith("_case") ? node.namedChildren : []);
 }
+var flowContinues = 1;
+var flowTerminates = 2;
 function unconditionallyTerminates(statement, target, callableBody, source) {
-  if (statement.type === "return_statement" || statement.type === "break_statement" || statement.type === "continue_statement") return true;
+  return terminationOutcomes(statement, target, callableBody, source) === flowTerminates;
+}
+function terminationOutcomes(statement, target, callableBody, source) {
+  if (statement.type === "return_statement") return flowTerminates;
+  if (statement.type === "break_statement" || statement.type === "continue_statement") {
+    let current = statement.parent;
+    while (current !== null && current.id !== callableBody.id) {
+      if (statement.type === "break_statement" && [
+        "for_statement",
+        "expression_switch_statement",
+        "type_switch_statement",
+        "select_statement"
+      ].includes(current.type) || statement.type === "continue_statement" && current.type === "for_statement") {
+        return containsNode(current, target) ? flowTerminates : flowContinues;
+      }
+      current = current.parent;
+    }
+    return flowContinues;
+  }
   if (statement.type === "goto_statement") {
     const labelName = statement.namedChildren[0] === void 0 ? void 0 : sourceText(statement.namedChildren[0], source);
     const label = labelName === void 0 ? void 0 : descendants(callableBody, "labeled_statement").find((candidate) => candidate.namedChildren[0] !== void 0 && sourceText(candidate.namedChildren[0], source) === labelName);
-    return label !== void 0 && label.startIndex > target.startIndex;
+    return label !== void 0 && label.startIndex > target.startIndex ? flowTerminates : flowContinues;
   }
-  if (statement.type !== "expression_statement") return false;
+  if (statement.type === "if_statement") {
+    const condition = statement.childForFieldName("condition");
+    const consequence = statement.childForFieldName("consequence");
+    const alternative = statement.childForFieldName("alternative");
+    const value = condition === null ? void 0 : staticBoolean(condition, source);
+    if (value === true) {
+      return consequence === null ? flowContinues : blockTerminationOutcomes(
+        consequence,
+        target,
+        callableBody,
+        source
+      );
+    }
+    if (value === false) {
+      return alternative === null ? flowContinues : blockTerminationOutcomes(
+        alternative,
+        target,
+        callableBody,
+        source
+      );
+    }
+    const consequenceOutcomes = consequence === null ? flowContinues : blockTerminationOutcomes(consequence, target, callableBody, source);
+    const alternativeOutcomes = alternative === null ? flowContinues : blockTerminationOutcomes(alternative, target, callableBody, source);
+    return consequenceOutcomes | alternativeOutcomes;
+  }
+  if (statement.type === "expression_switch_statement" || statement.type === "type_switch_statement") {
+    const cases = statement.namedChildren.filter((node) => node.type === "expression_case" || node.type === "type_case" || node.type === "default_case");
+    let outcomes = cases.some((node) => node.type === "default_case") ? 0 : flowContinues;
+    for (const item of cases) {
+      outcomes |= blockTerminationOutcomes(item, target, callableBody, source);
+    }
+    return outcomes;
+  }
+  if (statement.type === "select_statement") {
+    const cases = statement.namedChildren.filter((node) => node.type === "communication_case" || node.type === "default_case");
+    if (cases.length === 0) return flowTerminates;
+    let outcomes = 0;
+    for (const item of cases) {
+      outcomes |= blockTerminationOutcomes(item, target, callableBody, source);
+    }
+    return outcomes;
+  }
+  if (statement.type === "for_statement") {
+    const body2 = statement.childForFieldName("body");
+    const condition = statement.childForFieldName("condition");
+    const header = body2 === null ? "" : normalize(source.slice(statement.startIndex, body2.startIndex));
+    const infinite = condition === null ? /^for(?:;;)?$/.test(header) : staticBoolean(condition, source) === true;
+    return infinite && directCallableDescendants(statement, "break_statement").length === 0 && directCallableDescendants(statement, "goto_statement").length === 0 ? flowTerminates : flowContinues;
+  }
+  if (statement.type === "block" || statement.type === "else_clause" || statement.type.endsWith("_case")) {
+    return blockTerminationOutcomes(statement, target, callableBody, source);
+  }
+  if (statement.type !== "expression_statement") return flowContinues;
   const call = statement.namedChildren.find((node) => node.type === "call_expression");
   const fn = call?.childForFieldName("function");
-  return fn?.type === "identifier" && sourceText(fn, source) === "panic" && !callableParameterNamed(callableBody, "panic", source) && !localBindingShadowsAtUse(callableBody, "panic", call, source) && !packageBindingNamed(callableBody, "panic", source);
+  return fn?.type === "identifier" && sourceText(fn, source) === "panic" && !callableParameterNamed(callableBody, "panic", source) && !localBindingShadowsAtUse(callableBody, "panic", call, source) && !nestedCallableParameterShadowsAtUse(callableBody, "panic", call, source) && !packageBindingNamed(callableBody, "panic", source) ? flowTerminates : flowContinues;
+}
+function blockTerminationOutcomes(block, target, callableBody, source) {
+  const statements = directStatements(block);
+  if (statements.length > 0) {
+    let outcomes = flowContinues;
+    for (const statement of statements) {
+      if ((outcomes & flowContinues) === 0) break;
+      outcomes = outcomes & ~flowContinues | terminationOutcomes(statement, target, callableBody, source);
+    }
+    return outcomes;
+  }
+  const nested = block.namedChildren.find((node) => node.type === "block" || node.type === "if_statement" || node.type === "expression_switch_statement" || node.type === "type_switch_statement" || node.type === "select_statement" || node.type === "for_statement");
+  return nested === void 0 ? flowContinues : terminationOutcomes(nested, target, callableBody, source);
 }
 function packageBindingNamed(callableBody, name2, source) {
   let root = callableBody;
@@ -22379,9 +22464,9 @@ var pathContinues = 1;
 var pathTerminatesSafely = 2;
 var pathTerminatesUnsafely = 4;
 function blockTerminates(block, boundary, source, allowReturn) {
-  return blockTerminationOutcomes(block, boundary, source, allowReturn) === pathTerminatesSafely;
+  return blockTerminationOutcomes2(block, boundary, source, allowReturn) === pathTerminatesSafely;
 }
-function blockTerminationOutcomes(block, boundary, source, allowReturn) {
+function blockTerminationOutcomes2(block, boundary, source, allowReturn) {
   const statementList = block.type === "statement_list" ? block : block.namedChildren.find((node) => node.type === "statement_list");
   if (statementList === void 0) {
     const nested = block.namedChildren.find((node) => node.type === "block" || node.type === "if_statement" || node.type === "expression_switch_statement" || node.type === "type_switch_statement");
@@ -22405,14 +22490,14 @@ function statementTerminationOutcomes(statement, boundary, source, allowReturn) 
   if (statement.type === "if_statement") {
     const consequence = statement.childForFieldName("consequence");
     const alternative = statement.childForFieldName("alternative");
-    const consequenceOutcomes = consequence === null ? pathContinues : blockTerminationOutcomes(consequence, boundary, source, allowReturn);
-    const alternativeOutcomes = alternative === null ? pathContinues : blockTerminationOutcomes(alternative, boundary, source, allowReturn);
+    const consequenceOutcomes = consequence === null ? pathContinues : blockTerminationOutcomes2(consequence, boundary, source, allowReturn);
+    const alternativeOutcomes = alternative === null ? pathContinues : blockTerminationOutcomes2(alternative, boundary, source, allowReturn);
     return consequenceOutcomes | alternativeOutcomes;
   }
   if (statement.type === "expression_switch_statement" || statement.type === "type_switch_statement") {
     return switchTerminationOutcomes(statement, boundary, source, allowReturn);
   }
-  if (statement.type === "block") return blockTerminationOutcomes(statement, boundary, source, allowReturn);
+  if (statement.type === "block") return blockTerminationOutcomes2(statement, boundary, source, allowReturn);
   if (statement.type !== "expression_statement") return pathContinues;
   const call = statement.namedChildren[0];
   const callee = call?.type === "call_expression" ? call.childForFieldName("function") : null;
@@ -22422,7 +22507,7 @@ function switchTerminationOutcomes(statement, boundary, source, allowReturn) {
   const cases = statement.namedChildren.filter((node) => node.type === "expression_case" || node.type === "type_case" || node.type === "default_case");
   let outcomes = cases.some((node) => node.type === "default_case") ? 0 : pathContinues;
   for (const item of cases) {
-    outcomes |= blockTerminationOutcomes(item, boundary, source, allowReturn);
+    outcomes |= blockTerminationOutcomes2(item, boundary, source, allowReturn);
   }
   return outcomes;
 }

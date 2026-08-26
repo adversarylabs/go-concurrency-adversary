@@ -18,6 +18,12 @@ test("the published runtime executes without node_modules", async () => {
   const output = join(artifact, "output.json");
   const archive = join(artifact, "package.tar");
 
+  const ignored = (await readFile(join(projectRoot, ".adversaryignore"), "utf8"))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  assert.ok(ignored.includes(".git"));
+
   for (const path of ["dist/web-tree-sitter.wasm", "dist/tree-sitter-go.wasm"]) {
     await execute("git", ["ls-files", "--error-unmatch", path], { cwd: projectRoot });
   }

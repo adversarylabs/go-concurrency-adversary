@@ -368,6 +368,73 @@ test("tracks captured IIFE mutations and all-path cleanup execution", async () =
   assert.equal(safe.findings.some((item) => item.ruleId === ruleId), false);
 });
 
+test("applies exhaustive control-flow reachability to launches, callbacks, and stops", async () => {
+  const unreachableLaunch = vulnerableProject();
+  unreachableLaunch["plugins/server/internal/serve.go"] = unreachableLaunch["plugins/server/internal/serve.go"]!
+    .replace("  go func() {", "  if enabled() { return } else { return }\n  go func() {");
+  const unreachableStartCall = vulnerableProject();
+  unreachableStartCall["plugins/server/debug/plugin.go"] = unreachableStartCall["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "switch mode() { case 1: return nil; default: return nil }\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  const unreachableCallback = vulnerableProject();
+  unreachableCallback["plugins/server/internal/serve.go"] = unreachableCallback["plugins/server/internal/serve.go"]!
+    .replace("    _ = serve(listener)",
+      "    if enabled() { return } else { return }\n    _ = serve(listener)");
+  const infiniteLoop = vulnerableProject();
+  infiniteLoop["plugins/server/debug/plugin.go"] = infiniteLoop["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "for {}\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  const exhaustiveSelect = vulnerableProject();
+  exhaustiveSelect["plugins/server/debug/plugin.go"] = exhaustiveSelect["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "select { case <-ctx.Done(): return nil; default: return nil }\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  for (const files of [unreachableLaunch, unreachableStartCall, unreachableCallback, infiniteLoop,
+    exhaustiveSelect]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const unreachableStop = vulnerableProject();
+  unreachableStop["plugins/server/debug/plugin.go"] += `
+func (s server) Stop() {
+  if enabled() { return } else { return }
+  _ = s.handler.Close()
+}
+`;
+  const falseStop = vulnerableProject();
+  falseStop["plugins/server/debug/plugin.go"] += `
+func (s server) Stop() { if false { _ = s.handler.Close() } }
+`;
+  const shadowedStop = vulnerableProject();
+  shadowedStop["plugins/server/debug/plugin.go"] = shadowedStop["plugins/server/debug/plugin.go"]!
+    .replace("type server struct", "var other server\n\ntype server struct") + `
+func (s server) Stop() { if true { s := other; _ = s.handler.Close() } }
+`;
+  const partialIf = vulnerableProject();
+  partialIf["plugins/server/debug/plugin.go"] = partialIf["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "if enabled() { return nil }\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  const partialSwitch = vulnerableProject();
+  partialSwitch["plugins/server/debug/plugin.go"] = partialSwitch["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "switch mode() { case 1: return nil }\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  const breakableLoop = vulnerableProject();
+  breakableLoop["plugins/server/debug/plugin.go"] = breakableLoop["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "for { if enabled() { break } }\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  for (const files of [unreachableStop, falseStop, shadowedStop, partialIf, partialSwitch, breakableLoop]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+  }
+
+  const trueStop = vulnerableProject();
+  trueStop["plugins/server/debug/plugin.go"] += `
+func (s server) Stop() { if true { _ = s.handler.Close() } }
+`;
+  const safe = await review(await repository(trueStop));
+  assert.equal(safe.findings.some((item) => item.ruleId === ruleId), false);
+});
+
 test("anchors helper callback and weakened-stop activation guards", async () => {
   const callbackGuard = vulnerableProject();
   callbackGuard["plugins/server/internal/serve.go"] = callbackGuard["plugins/server/internal/serve.go"]!
