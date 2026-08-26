@@ -75,7 +75,7 @@ test("requires the imported helper to resolve to the proven package", async () =
 
 test("binds the owned listener and Serve callback to the helper's exact parameter positions", async () => {
   const files = vulnerableProject();
-  files["plugins/server/internal/serve.go"] = `package internal
+files["plugins/server/internal/serve.go"] = `package internal
 
 import "net"
 
@@ -201,6 +201,120 @@ test("fails closed for a cross-package helper when module identity is unavailabl
   delete files["go.mod"];
   const output = await review(await repository(files));
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
+test("keeps listener, receiver, callback, range, and goroutine bindings lexical", async () => {
+  const innerListener = vulnerableProject();
+  innerListener["plugins/server/debug/plugin.go"] = innerListener["plugins/server/debug/plugin.go"]!
+    .replace(
+      `listener, err := net.Listen("tcp", ":0")
+  if err != nil { return err }`,
+      `var listener net.Listener
+  if enabled() {
+    listener, err := net.Listen("tcp", ":0")
+    if err != nil { return err }
+    _ = listener
+  }`,
+    );
+  const reassignedReceiver = vulnerableProject();
+  reassignedReceiver["plugins/server/debug/plugin.go"] = reassignedReceiver["plugins/server/debug/plugin.go"]!
+    .replace("  listener, err :=", "  s = other\n  listener, err :=") + "\nvar other server\n";
+  const conditionallyReassignedReceiver = vulnerableProject();
+  conditionallyReassignedReceiver["plugins/server/debug/plugin.go"] =
+    conditionallyReassignedReceiver["plugins/server/debug/plugin.go"]!
+      .replace("  listener, err :=", "  if enabled() { s = other }\n  listener, err :=") + "\nvar other server\n";
+  const literalParameters = vulnerableProject();
+  literalParameters["plugins/server/internal/serve.go"] = `package internal
+
+import (
+  "context"
+  "net"
+)
+
+func Serve(ctx context.Context, listener net.Listener, serve func(net.Listener) error) {
+  _ = ctx
+  go func(listener net.Listener, serve func(net.Listener) error) {
+    defer listener.Close()
+    _ = serve(listener)
+  }(nil, func(net.Listener) error { return nil })
+}
+`;
+  const reassignedCallback = vulnerableProject();
+  reassignedCallback["plugins/server/internal/serve.go"] = reassignedCallback["plugins/server/internal/serve.go"]!
+    .replace("    defer listener.Close()", "    serve = func(net.Listener) error { return nil }\n    defer listener.Close()");
+  const conditionallyReassignedCallback = vulnerableProject();
+  conditionallyReassignedCallback["plugins/server/internal/serve.go"] =
+    conditionallyReassignedCallback["plugins/server/internal/serve.go"]!
+      .replace("    defer listener.Close()",
+        "    if enabled() { serve = func(net.Listener) error { return nil } }\n    defer listener.Close()");
+  const panicBeforeLaunch = vulnerableProject();
+  panicBeforeLaunch["plugins/server/internal/serve.go"] = panicBeforeLaunch["plugins/server/internal/serve.go"]!
+    .replace("  _ = ctx", "  panic(\"stop\")");
+  const rangeShadow = vulnerableProject();
+  rangeShadow["plugins/server/debug/plugin.go"] = rangeShadow["plugins/server/debug/plugin.go"]!
+    .replace(
+      "internal.Serve(ctx, listener, s.handler.Serve)",
+      "for _, listener := range []net.Listener{nil} {\n    internal.Serve(ctx, listener, s.handler.Serve)\n  }",
+    );
+
+  for (const files of [innerListener, reassignedReceiver, conditionallyReassignedReceiver, literalParameters,
+    reassignedCallback, conditionallyReassignedCallback, panicBeforeLaunch, rangeShadow]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+  }
+});
+
+test("does not confuse conditional or post-Serve cleanup with an initiating shutdown path", async () => {
+  const reassignedCloseReceiver = vulnerableProject();
+  reassignedCloseReceiver["plugins/server/debug/plugin.go"] += `
+func (s server) Close(other server) error {
+  s = other
+  return s.handler.Close()
+}
+`;
+  const conditionalClose = vulnerableProject();
+  conditionalClose["plugins/server/internal/serve.go"] = conditionalClose["plugins/server/internal/serve.go"]!
+    .replace("  _ = ctx", "  if shouldClose() { _ = listener.Close() }");
+  const shadowedClose = vulnerableProject();
+  shadowedClose["plugins/server/internal/serve.go"] = shadowedClose["plugins/server/internal/serve.go"]!
+    .replace("  _ = ctx", `  go func(listener net.Listener) {
+    _ = listener.Close()
+  }(nil)`);
+  const postServeClose = vulnerableProject();
+  postServeClose["plugins/server/internal/serve.go"] = postServeClose["plugins/server/internal/serve.go"]!
+    .replace("    defer listener.Close()\n", "")
+    .replace("    _ = serve(listener)", "    _ = serve(listener)\n    _ = listener.Close()");
+  const gotoLaunch = vulnerableProject();
+  gotoLaunch["plugins/server/internal/serve.go"] = gotoLaunch["plugins/server/internal/serve.go"]!
+    .replace("  go func() {", "  goto launch\nlaunch:\n  go func() {");
+  const shadowedPanic = vulnerableProject();
+  shadowedPanic["plugins/server/internal/serve.go"] = shadowedPanic["plugins/server/internal/serve.go"]!
+    .replace("  _ = ctx", "  panic(\"observe\")")
+    .replace(")\n\nfunc Serve", ")\n\nvar panic = func(any) {}\n\nfunc Serve");
+
+  for (const files of [reassignedCloseReceiver, conditionalClose, shadowedClose, postServeClose, gotoLaunch,
+    shadowedPanic]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+  }
+});
+
+test("anchors the changed guard that activates a previously dead helper call", async () => {
+  const files = vulnerableProject();
+  files["plugins/server/debug/plugin.go"] = files["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "if false { internal.Serve(ctx, listener, s.handler.Serve) }");
+  const root = await repository(files, true);
+  await writeFile(
+    join(root, "plugins/server/debug/plugin.go"),
+    files["plugins/server/debug/plugin.go"]!.replace("if false {", "if enabled() {"),
+  );
+  const output = await changedReview(root, [
+    "plugins/server/debug/plugin.go",
+    "plugins/server/internal/serve.go",
+  ]);
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.match(finding?.evidence[0]?.snippet ?? "", /enabled/);
 });
 
 test("accepts an explicit listener stop path and a one-step server alias", async () => {
