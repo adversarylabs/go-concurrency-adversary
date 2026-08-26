@@ -21214,7 +21214,10 @@ function collectFacts(files, modulePath) {
           { parsed, node: method.childForFieldName("name") ?? method },
           ...controlFlowEvidence(call, body2).map((node) => ({ parsed, node })),
           { parsed, node: call },
+          ...helper.lifecycleEvidence.map((node) => ({ parsed: helper.parsed, node })),
+          ...controlFlowEvidence(helper.callbackCall, helper.goStatement).map((node) => ({ parsed: helper.parsed, node })),
           { parsed: helper.parsed, node: helper.goStatement },
+          { parsed: helper.parsed, node: helper.callbackCall },
           ...typeMethods.filter((candidate) => candidate.parsed !== parsed || candidate.node.id !== method.id).map((candidate) => ({ parsed: candidate.parsed, node: candidate.node }))
         ];
         const signature = [
@@ -21299,7 +21302,8 @@ function collectAsyncHelpers(parsed) {
         callbackParameter: callbackName,
         callbackParameterIndex: callback.index,
         goStatement,
-        callbackCall
+        callbackCall,
+        lifecycleEvidence: listenerStopEvidence(body2, source, listenerName)
       });
     }
   }
@@ -21402,16 +21406,24 @@ function helperStopsListener(body2, source, listenerName, callbackCall) {
     return closeCallable?.id !== callbackCallable?.id || call.startIndex < callbackCall.startIndex;
   });
 }
+function listenerStopEvidence(body2, source, listenerName) {
+  const evidence = [];
+  for (const call of descendants(body2, "call_expression")) {
+    const fn = call.childForFieldName("function");
+    if (fn?.type !== "selector_expression") continue;
+    const operand = fn.childForFieldName("operand");
+    const field = fn.childForFieldName("field");
+    if (operand?.type !== "identifier" || field === null || sourceText(operand, source) !== listenerName || !/^(?:Close|Shutdown|Stop)$/.test(sourceText(field, source))) continue;
+    evidence.push(...controlFlowEvidence(call, body2), call);
+  }
+  return evidence;
+}
 function callIsDefinitelyActive(call, callableBody) {
   let current = call.parent;
   while (current !== null && current.id !== callableBody.id) {
     if (current.type === "func_literal") {
-      const invocation = current.parent;
-      if (invocation?.type !== "call_expression" || invocation.childForFieldName("function")?.id !== current.id) {
-        return false;
-      }
-      const execution = invocation.parent;
-      if (execution?.type !== "go_statement" && execution?.type !== "expression_statement") return false;
+      const execution = directLiteralExecution(current);
+      if (execution === void 0) return false;
       current = execution.parent;
       continue;
     }
@@ -21420,18 +21432,39 @@ function callIsDefinitelyActive(call, callableBody) {
   return current?.id === callableBody.id;
 }
 function unconditionallyExecutedWithinCallable(node, callableBody) {
-  let current = node.parent;
-  while (current !== null && current.id !== callableBody.id && current.type !== "func_literal") {
+  let current = node;
+  while (current !== null && current.id !== callableBody.id) {
+    const parent = current.parent;
+    if (parent === null) return false;
+    if (parent.type === "func_literal") {
+      const execution = directLiteralExecution(parent);
+      if (execution === void 0) return false;
+      current = execution;
+      continue;
+    }
     if ([
       "if_statement",
       "for_statement",
       "expression_switch_statement",
       "type_switch_statement",
       "select_statement"
-    ].includes(current.type)) return false;
-    current = current.parent;
+    ].includes(parent.type)) return false;
+    current = parent;
   }
-  return current !== null;
+  return current?.id === callableBody.id;
+}
+function directLiteralExecution(literal) {
+  let expression = literal;
+  while (expression.parent?.type === "parenthesized_expression" && expression.parent.namedChildren.length === 1) expression = expression.parent;
+  const invocation = expression.parent;
+  if (invocation?.type !== "call_expression") return void 0;
+  let called = invocation.childForFieldName("function");
+  while (called?.type === "parenthesized_expression" && called.namedChildren.length === 1) {
+    called = called.namedChildren[0] ?? null;
+  }
+  if (called?.id !== literal.id) return void 0;
+  const execution = invocation.parent;
+  return execution !== null && (execution.type === "go_statement" || execution.type === "expression_statement") ? execution : void 0;
 }
 function isHandlerServeMethod(node, source, receiver, fieldName, body2) {
   if (node.type !== "selector_expression") return false;
@@ -21489,7 +21522,7 @@ function bindingChangesBetween(body2, name2, startIndex, use, source) {
     ...descendants(body2, "range_clause")
   ];
   return changes.some((change) => {
-    if (change.startIndex <= startIndex || change.endIndex >= use.startIndex || !bindingNames(change, source).includes(name2) || !sameCallableScope(change, use, body2)) return false;
+    if (change.startIndex <= startIndex || change.endIndex >= use.startIndex || !bindingNames(change, source).includes(name2) || !sameCallableScope(change, use, body2) || !nodeIsReachable(change, body2, source)) return false;
     if (change.type === "short_var_declaration" || change.type === "range_clause" && sourceText(change, source).includes(":=")) {
       return declarationScopeContainsUse(change, use);
     }

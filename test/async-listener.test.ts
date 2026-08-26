@@ -299,6 +299,69 @@ func (s server) Close(other server) error {
   }
 });
 
+test("keeps unreachable binding changes separate and requires a definite IIFE stop", async () => {
+  const unreachableListener = vulnerableProject();
+  unreachableListener["plugins/server/debug/plugin.go"] = unreachableListener["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "if false { listener = nil }\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  const unreachableReceiver = vulnerableProject();
+  unreachableReceiver["plugins/server/debug/plugin.go"] = unreachableReceiver["plugins/server/debug/plugin.go"]!
+    .replace("type server struct", "var other server\n\ntype server struct")
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "if false { s = other }\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  const conditionalIIFE = vulnerableProject();
+  conditionalIIFE["plugins/server/internal/serve.go"] = conditionalIIFE["plugins/server/internal/serve.go"]!
+    .replace("  _ = ctx", "  if shouldClose() { func() { _ = listener.Close() }() }");
+  for (const files of [unreachableListener, unreachableReceiver, conditionalIIFE]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+  }
+
+  const unconditionalIIFE = vulnerableProject();
+  unconditionalIIFE["plugins/server/internal/serve.go"] = unconditionalIIFE["plugins/server/internal/serve.go"]!
+    .replace("  _ = ctx", "  func() { _ = listener.Close() }()");
+  const parenthesizedIIFE = vulnerableProject();
+  parenthesizedIIFE["plugins/server/internal/serve.go"] = parenthesizedIIFE["plugins/server/internal/serve.go"]!
+    .replace("  _ = ctx", "  (func() { _ = listener.Close() })()");
+  for (const files of [unconditionalIIFE, parenthesizedIIFE]) {
+    const safe = await review(await repository(files));
+    assert.equal(safe.findings.some((item) => item.ruleId === ruleId), false);
+  }
+});
+
+test("anchors helper callback and weakened-stop activation guards", async () => {
+  const callbackGuard = vulnerableProject();
+  callbackGuard["plugins/server/internal/serve.go"] = callbackGuard["plugins/server/internal/serve.go"]!
+    .replace("    _ = serve(listener)", "    if false { _ = serve(listener) }");
+  const callbackRoot = await repository(callbackGuard, true);
+  await writeFile(
+    join(callbackRoot, "plugins/server/internal/serve.go"),
+    callbackGuard["plugins/server/internal/serve.go"]!.replace("if false {", "if enabled() {"),
+  );
+  const callbackOutput = await changedReview(callbackRoot, [
+    "plugins/server/debug/plugin.go",
+    "plugins/server/internal/serve.go",
+  ]);
+  const callbackFinding = callbackOutput.findings.find((item) => item.ruleId === ruleId);
+  assert.match(callbackFinding?.evidence[0]?.snippet ?? "", /enabled/);
+
+  const weakenedStop = vulnerableProject();
+  weakenedStop["plugins/server/internal/serve.go"] = weakenedStop["plugins/server/internal/serve.go"]!
+    .replace("  _ = ctx", "  _ = listener.Close()");
+  const stopRoot = await repository(weakenedStop, true);
+  await writeFile(
+    join(stopRoot, "plugins/server/internal/serve.go"),
+    weakenedStop["plugins/server/internal/serve.go"]!
+      .replace("_ = listener.Close()", "if enabled() { _ = listener.Close() }"),
+  );
+  const stopOutput = await changedReview(stopRoot, [
+    "plugins/server/debug/plugin.go",
+    "plugins/server/internal/serve.go",
+  ]);
+  const stopFinding = stopOutput.findings.find((item) => item.ruleId === ruleId);
+  assert.match(stopFinding?.evidence[0]?.snippet ?? "", /enabled/);
+});
+
 test("anchors the changed guard that activates a previously dead helper call", async () => {
   const files = vulnerableProject();
   files["plugins/server/debug/plugin.go"] = files["plugins/server/debug/plugin.go"]!

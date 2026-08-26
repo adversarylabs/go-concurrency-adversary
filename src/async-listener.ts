@@ -26,6 +26,7 @@ interface AsyncListenerHelper {
   callbackParameterIndex: number;
   goStatement: Node;
   callbackCall: Node;
+  lifecycleEvidence: Node[];
 }
 
 interface ServerType {
@@ -163,7 +164,11 @@ function collectFacts(files: ParsedFile[], modulePath: string | undefined): Asyn
           { parsed, node: method.childForFieldName("name") ?? method },
           ...controlFlowEvidence(call, body).map((node) => ({ parsed, node })),
           { parsed, node: call },
+          ...helper.lifecycleEvidence.map((node) => ({ parsed: helper.parsed, node })),
+          ...controlFlowEvidence(helper.callbackCall, helper.goStatement)
+            .map((node) => ({ parsed: helper.parsed, node })),
           { parsed: helper.parsed, node: helper.goStatement },
+          { parsed: helper.parsed, node: helper.callbackCall },
           ...typeMethods
             .filter((candidate) => candidate.parsed !== parsed || candidate.node.id !== method.id)
             .map((candidate) => ({ parsed: candidate.parsed, node: candidate.node })),
@@ -264,6 +269,7 @@ function collectAsyncHelpers(parsed: ParsedFile): AsyncListenerHelper[] {
         callbackParameterIndex: callback.index,
         goStatement,
         callbackCall,
+        lifecycleEvidence: listenerStopEvidence(body, source, listenerName),
       });
     }
   }
@@ -397,16 +403,32 @@ function helperStopsListener(body: Node, source: string, listenerName: string, c
   });
 }
 
+/**
+ * Preserve surviving semantic evidence when an edit weakens a definite stop
+ * into a conditional one. The call alone spans the same text before and after;
+ * the controlling condition is the changed lifecycle boundary.
+ */
+function listenerStopEvidence(body: Node, source: string, listenerName: string): Node[] {
+  const evidence: Node[] = [];
+  for (const call of descendants(body, "call_expression")) {
+    const fn = call.childForFieldName("function");
+    if (fn?.type !== "selector_expression") continue;
+    const operand = fn.childForFieldName("operand");
+    const field = fn.childForFieldName("field");
+    if (operand?.type !== "identifier" || field === null ||
+        sourceText(operand, source) !== listenerName ||
+        !/^(?:Close|Shutdown|Stop)$/.test(sourceText(field, source))) continue;
+    evidence.push(...controlFlowEvidence(call, body), call);
+  }
+  return evidence;
+}
+
 function callIsDefinitelyActive(call: Node, callableBody: Node): boolean {
   let current: Node | null = call.parent;
   while (current !== null && current.id !== callableBody.id) {
     if (current.type === "func_literal") {
-      const invocation = current.parent;
-      if (invocation?.type !== "call_expression" || invocation.childForFieldName("function")?.id !== current.id) {
-        return false;
-      }
-      const execution = invocation.parent;
-      if (execution?.type !== "go_statement" && execution?.type !== "expression_statement") return false;
+      const execution = directLiteralExecution(current);
+      if (execution === undefined) return false;
       current = execution.parent;
       continue;
     }
@@ -416,13 +438,38 @@ function callIsDefinitelyActive(call: Node, callableBody: Node): boolean {
 }
 
 function unconditionallyExecutedWithinCallable(node: Node, callableBody: Node): boolean {
-  let current: Node | null = node.parent;
-  while (current !== null && current.id !== callableBody.id && current.type !== "func_literal") {
+  let current: Node | null = node;
+  while (current !== null && current.id !== callableBody.id) {
+    const parent: Node | null = current.parent;
+    if (parent === null) return false;
+    if (parent.type === "func_literal") {
+      const execution = directLiteralExecution(parent);
+      if (execution === undefined) return false;
+      current = execution;
+      continue;
+    }
     if (["if_statement", "for_statement", "expression_switch_statement", "type_switch_statement",
-      "select_statement"].includes(current.type)) return false;
-    current = current.parent;
+      "select_statement"].includes(parent.type)) return false;
+    current = parent;
   }
-  return current !== null;
+  return current?.id === callableBody.id;
+}
+
+function directLiteralExecution(literal: Node): Node | undefined {
+  let expression = literal;
+  while (expression.parent?.type === "parenthesized_expression" &&
+    expression.parent.namedChildren.length === 1) expression = expression.parent;
+  const invocation = expression.parent;
+  if (invocation?.type !== "call_expression") return undefined;
+  let called = invocation.childForFieldName("function");
+  while (called?.type === "parenthesized_expression" && called.namedChildren.length === 1) {
+    called = called.namedChildren[0] ?? null;
+  }
+  if (called?.id !== literal.id) return undefined;
+  const execution = invocation.parent;
+  return execution !== null && (execution.type === "go_statement" || execution.type === "expression_statement")
+    ? execution
+    : undefined;
 }
 
 function isHandlerServeMethod(
@@ -510,7 +557,8 @@ function bindingChangesBetween(
   return changes.some((change) => {
     if (change.startIndex <= startIndex || change.endIndex >= use.startIndex ||
         !bindingNames(change, source).includes(name) ||
-        !sameCallableScope(change, use, body)) return false;
+        !sameCallableScope(change, use, body) ||
+        !nodeIsReachable(change, body, source)) return false;
     if (change.type === "short_var_declaration" ||
         (change.type === "range_clause" && sourceText(change, source).includes(":" + "="))) {
       return declarationScopeContainsUse(change, use);
