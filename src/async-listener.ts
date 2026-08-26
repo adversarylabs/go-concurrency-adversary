@@ -706,6 +706,7 @@ function directStatements(node: Node): Node[] {
 
 const flowContinues = 1;
 const flowTerminates = 2;
+const flowFallsThrough = 4;
 
 function unconditionallyTerminates(statement: Node, target: Node, callableBody: Node, source: string): boolean {
   return terminationOutcomes(statement, target, callableBody, source) === flowTerminates;
@@ -734,6 +735,7 @@ function terminationOutcomes(statement: Node, target: Node, callableBody: Node, 
         sourceText(candidate.namedChildren[0]!, source) === labelName);
     return label !== undefined && label.startIndex > target.startIndex ? flowTerminates : flowContinues;
   }
+  if (statement.type === "fallthrough_statement") return flowFallsThrough;
   if (statement.type === "if_statement") {
     const condition = statement.childForFieldName("condition");
     const consequence = statement.childForFieldName("consequence");
@@ -759,9 +761,13 @@ function terminationOutcomes(statement: Node, target: Node, callableBody: Node, 
     const cases = statement.namedChildren.filter((node) =>
       node.type === "expression_case" || node.type === "type_case" || node.type === "default_case");
     let outcomes = cases.some((node) => node.type === "default_case") ? 0 : flowContinues;
-    for (const item of cases) {
-      outcomes |= blockTerminationOutcomes(item, target, callableBody, source);
+    const resolved = new Array<number>(cases.length);
+    for (let index = cases.length - 1; index >= 0; index -= 1) {
+      const raw = blockTerminationOutcomes(cases[index]!, target, callableBody, source);
+      resolved[index] = (raw & ~flowFallsThrough) |
+        ((raw & flowFallsThrough) === 0 ? 0 : (resolved[index + 1] ?? flowContinues));
     }
+    for (const outcome of resolved) outcomes |= outcome;
     return outcomes;
   }
   if (statement.type === "select_statement") {
@@ -779,8 +785,11 @@ function terminationOutcomes(statement: Node, target: Node, callableBody: Node, 
     const condition = statement.childForFieldName("condition");
     const header = body === null ? "" : normalize(source.slice(statement.startIndex, body.startIndex));
     const infinite = condition === null ? /^for(?:;;)?$/.test(header) : staticBoolean(condition, source) === true;
-    return infinite && directCallableDescendants(statement, "break_statement").length === 0 &&
-      directCallableDescendants(statement, "goto_statement").length === 0
+    const escapingBreak = body !== null && directCallableDescendants(statement, "break_statement")
+      .some((candidate) => nodeIsReachable(candidate, body, source) && breakExitsLoop(candidate, statement, source));
+    const escapingGoto = body !== null && directCallableDescendants(statement, "goto_statement")
+      .some((candidate) => nodeIsReachable(candidate, body, source) && gotoExitsLoop(candidate, statement, source));
+    return infinite && !escapingBreak && !escapingGoto
       ? flowTerminates
       : flowContinues;
   }
@@ -797,6 +806,39 @@ function terminationOutcomes(statement: Node, target: Node, callableBody: Node, 
     !packageBindingNamed(callableBody, "panic", source)
     ? flowTerminates
     : flowContinues;
+}
+
+function breakExitsLoop(statement: Node, loop: Node, source: string): boolean {
+  const labelNode = statement.namedChildren[0];
+  if (labelNode !== undefined) {
+    const labelName = sourceText(labelNode, source);
+    let root: Node = loop;
+    while (root.parent !== null) root = root.parent;
+    return descendants(root, "labeled_statement").some((candidate) => {
+      const name = candidate.namedChildren[0];
+      return name !== undefined && sourceText(name, source) === labelName && containsNode(candidate, loop);
+    });
+  }
+  let current = statement.parent;
+  while (current !== null) {
+    if (["for_statement", "expression_switch_statement", "type_switch_statement", "select_statement"]
+      .includes(current.type)) return current.id === loop.id;
+    current = current.parent;
+  }
+  return false;
+}
+
+function gotoExitsLoop(statement: Node, loop: Node, source: string): boolean {
+  const labelNode = statement.namedChildren[0];
+  if (labelNode === undefined) return true;
+  let root: Node = loop;
+  while (root.parent !== null) root = root.parent;
+  const labelName = sourceText(labelNode, source);
+  const label = descendants(root, "labeled_statement").find((candidate) => {
+    const name = candidate.namedChildren[0];
+    return name !== undefined && sourceText(name, source) === labelName;
+  });
+  return label === undefined || !containsNode(loop, label);
 }
 
 function blockTerminationOutcomes(

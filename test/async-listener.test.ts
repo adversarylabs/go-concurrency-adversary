@@ -388,8 +388,20 @@ test("applies exhaustive control-flow reachability to launches, callbacks, and s
   exhaustiveSelect["plugins/server/debug/plugin.go"] = exhaustiveSelect["plugins/server/debug/plugin.go"]!
     .replace("internal.Serve(ctx, listener, s.handler.Serve)",
       "select { case <-ctx.Done(): return nil; default: return nil }\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  const deadBreakLoop = vulnerableProject();
+  deadBreakLoop["plugins/server/debug/plugin.go"] = deadBreakLoop["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "for { if false { break } }\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  const nestedSwitchBreak = vulnerableProject();
+  nestedSwitchBreak["plugins/server/debug/plugin.go"] = nestedSwitchBreak["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "for { switch mode() { default: break } }\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  const terminatingFallthrough = vulnerableProject();
+  terminatingFallthrough["plugins/server/debug/plugin.go"] = terminatingFallthrough["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "switch mode() { case 1: fallthrough; default: return nil }\n  internal.Serve(ctx, listener, s.handler.Serve)");
   for (const files of [unreachableLaunch, unreachableStartCall, unreachableCallback, infiniteLoop,
-    exhaustiveSelect]) {
+    exhaustiveSelect, deadBreakLoop, nestedSwitchBreak, terminatingFallthrough]) {
     const output = await review(await repository(files));
     assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
   }
