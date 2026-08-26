@@ -21140,8 +21140,8 @@ async function analyzeAsyncListenerOwnership(discovery) {
   const current = await parseRelevantFiles(discovery.files, false);
   const previous = discovery.mode === "diff" ? await parseRelevantFiles(discovery.files, true) : [];
   try {
-    const currentFacts = collectFacts(current);
-    const previousSignatures = new Set(collectFacts(previous).map((fact) => fact.signature));
+    const currentFacts = collectFacts(current, discovery.modulePath);
+    const previousSignatures = new Set(collectFacts(previous, discovery.modulePath).map((fact) => fact.signature));
     const signals = [];
     for (const fact of currentFacts) {
       if (discovery.mode === "diff" && previousSignatures.has(fact.signature)) continue;
@@ -21181,7 +21181,7 @@ async function parseRelevantFiles(files, previous) {
   }
   return parsed;
 }
-function collectFacts(files) {
+function collectFacts(files, modulePath) {
   const helpers = files.flatMap(collectAsyncHelpers);
   const serverTypes = files.flatMap(collectHTTPServerTypes);
   const methods = files.flatMap((parsed) => descendants(parsed.root, "method_declaration").map((node) => ({ parsed, node })));
@@ -21197,15 +21197,18 @@ function collectFacts(files) {
       if (body2 === null) continue;
       const receiver = receiverName(method, parsed.file.current);
       if (receiver === void 0) continue;
-      const listenerNames = listenerVariables(body2, parsed);
-      if (listenerNames.size === 0) continue;
+      const listenerOrigins = listenerVariables(body2, parsed);
+      if (listenerOrigins.size === 0) continue;
       for (const call of directCallableDescendants(body2, "call_expression")) {
-        const helper = resolveAsyncHelper(call, parsed, helpers);
+        if (!nodeIsReachable(call, body2, parsed.file.current)) continue;
+        const helper = resolveAsyncHelper(call, parsed, helpers, modulePath, body2);
         if (helper === void 0) continue;
         const args2 = call.childForFieldName("arguments")?.namedChildren ?? [];
-        const listener = args2.find((arg) => arg.type === "identifier" && listenerNames.has(sourceText(arg, parsed.file.current)));
-        const serveMethod = args2.find((arg) => isHandlerServeMethod(arg, parsed.file.current, receiver, server.handlerField));
-        if (listener === void 0 || serveMethod === void 0) continue;
+        const listener = args2[helper.listenerParameterIndex];
+        const serveMethod = args2[helper.callbackParameterIndex];
+        const listenerName = listener?.type === "identifier" ? sourceText(listener, parsed.file.current) : void 0;
+        const listenerOrigin = listenerName === void 0 ? void 0 : listenerOrigins.get(listenerName);
+        if (listener?.type !== "identifier" || listenerOrigin === void 0 || bindingChangesBetween(body2, listenerName, listenerOrigin.endIndex, call, parsed.file.current) || serveMethod === void 0 || !isHandlerServeMethod(serveMethod, parsed.file.current, receiver, server.handlerField, body2)) continue;
         const evidence = [
           { parsed: server.parsed, node: server.field },
           { parsed, node: method.childForFieldName("name") ?? method },
@@ -21221,7 +21224,8 @@ function collectFacts(files) {
           helper.parsed.directory,
           helper.parsed.packageName,
           helper.name,
-          semantic(sourceText(call, parsed.file.current))
+          semantic(sourceText(listener, parsed.file.current)),
+          semantic(sourceText(serveMethod, parsed.file.current))
         ].join("|");
         facts.push({ signature, server, startMethod: method, helper, asyncCall: call, evidence });
       }
@@ -21264,30 +21268,35 @@ function collectAsyncHelpers(parsed) {
     const name2 = fn.childForFieldName("name");
     const body2 = fn.childForFieldName("body");
     if (name2 === null || body2 === null) continue;
-    const parameters = directParameters(fn);
-    const listener = parameters.find((parameter) => normalize(sourceText(parameter.childForFieldName("type") ?? parameter, source)) === `${netAlias}.Listener`);
-    const callback = parameters.find((parameter) => normalize(sourceText(parameter.childForFieldName("type") ?? parameter, source)) === `func${netAlias}.Listenererror`);
-    const listenerName = listener === void 0 ? void 0 : declaredNames(listener, source)[0];
-    const callbackName = callback === void 0 ? void 0 : declaredNames(callback, source)[0];
-    if (listenerName === void 0 || callbackName === void 0) continue;
+    const parameters = directParameterBindings(fn, source);
+    const listener = parameters.find((parameter) => normalize(parameter.type) === `${netAlias}.Listener`);
+    const callback = parameters.find((parameter) => normalize(parameter.type) === `func${netAlias}.Listenererror`);
+    if (listener === void 0 || callback === void 0) continue;
+    const listenerName = listener.name;
+    const callbackName = callback.name;
     if (helperStopsListener(body2, source, listenerName)) continue;
     for (const goStatement of directCallableDescendants(body2, "go_statement")) {
+      if (!nodeIsReachable(goStatement, body2, source)) continue;
+      if (bindingChangesBetween(body2, listenerName, body2.startIndex, goStatement, source) || bindingChangesBetween(body2, callbackName, body2.startIndex, goStatement, source)) continue;
       const invocation = goStatement.namedChildren.find((node) => node.type === "call_expression");
       const literal = invocation?.childForFieldName("function");
       if (literal?.type !== "func_literal") continue;
       const literalBody = literal.childForFieldName("body");
       if (literalBody === null) continue;
       const callbackCall = directCallableDescendants(literalBody, "call_expression").find((call) => {
+        if (!nodeIsReachable(call, literalBody, source)) return false;
         const called = call.childForFieldName("function");
         const args2 = call.childForFieldName("arguments")?.namedChildren ?? [];
-        return called?.type === "identifier" && sourceText(called, source) === callbackName && args2.length === 1 && args2[0]?.type === "identifier" && sourceText(args2[0], source) === listenerName;
+        return called?.type === "identifier" && sourceText(called, source) === callbackName && !localBindingShadowsAtUse(literalBody, callbackName, call, source) && args2.length === 1 && args2[0]?.type === "identifier" && sourceText(args2[0], source) === listenerName && !localBindingShadowsAtUse(literalBody, listenerName, args2[0], source);
       });
       if (callbackCall === void 0 || !defersListenerClose(literalBody, source, listenerName)) continue;
       helpers.push({
         parsed,
         name: sourceText(name2, source),
         listenerParameter: listenerName,
+        listenerParameterIndex: listener.index,
         callbackParameter: callbackName,
+        callbackParameterIndex: callback.index,
         goStatement,
         callbackCall
       });
@@ -21295,20 +21304,23 @@ function collectAsyncHelpers(parsed) {
   }
   return helpers;
 }
-function resolveAsyncHelper(call, caller, helpers) {
+function resolveAsyncHelper(call, caller, helpers, modulePath, callerBody) {
   const fn = call.childForFieldName("function");
   if (fn?.type === "identifier") {
     const name3 = sourceText(fn, caller.file.current);
+    if (callableParameterNamed(callerBody, name3, caller.file.current) || localBindingShadowsAtUse(callerBody, name3, call, caller.file.current)) return void 0;
     return helpers.find((helper) => helper.name === name3 && samePackage(helper.parsed, caller));
   }
   if (fn?.type !== "selector_expression") return void 0;
   const operand = fn.childForFieldName("operand");
   const field = fn.childForFieldName("field");
   if (operand?.type !== "identifier" || field === null) return void 0;
-  const importPath = caller.importsByAlias.get(sourceText(operand, caller.file.current));
+  const alias = sourceText(operand, caller.file.current);
+  if (callableParameterNamed(callerBody, alias, caller.file.current) || localBindingShadowsAtUse(callerBody, alias, call, caller.file.current)) return void 0;
+  const importPath = caller.importsByAlias.get(alias);
   if (importPath === void 0) return void 0;
   const name2 = sourceText(field, caller.file.current);
-  return helpers.find((helper) => helper.name === name2 && importResolvesTo(importPath, helper.parsed));
+  return helpers.find((helper) => helper.name === name2 && importResolvesTo(importPath, helper.parsed, modulePath));
 }
 function startContract(method, parsed) {
   const contextAlias = aliasForPath(parsed.importsByAlias, "context");
@@ -21322,14 +21334,8 @@ function startContract(method, parsed) {
 function listenerVariables(body2, parsed) {
   const source = parsed.file.current;
   const netAlias = aliasForPath(parsed.importsByAlias, "net");
-  if (netAlias === void 0) return /* @__PURE__ */ new Set();
-  const names = /* @__PURE__ */ new Set();
-  for (const spec of directCallableDescendants(body2, "var_spec")) {
-    const type = spec.childForFieldName("type");
-    if (type !== null && normalize(sourceText(type, source)) === `${netAlias}.Listener`) {
-      for (const name2 of declaredNames(spec, source)) names.add(name2);
-    }
-  }
+  if (netAlias === void 0) return /* @__PURE__ */ new Map();
+  const names = /* @__PURE__ */ new Map();
   for (const assignment of directCallableDescendants(body2, "short_var_declaration")) {
     const left = assignment.childForFieldName("left")?.namedChildren ?? [];
     const right = assignment.childForFieldName("right")?.namedChildren ?? [];
@@ -21337,9 +21343,9 @@ function listenerVariables(body2, parsed) {
       const value = right[index];
       if (value?.type !== "call_expression") continue;
       const fn = value.childForFieldName("function");
-      if (fn !== null && normalize(sourceText(fn, source)) === `${netAlias}.Listen`) {
+      if (fn?.type === "selector_expression" && sourceText(fn.childForFieldName("operand") ?? fn, source) === netAlias && sourceText(fn.childForFieldName("field") ?? fn, source) === "Listen" && !callableParameterNamed(body2, netAlias, source) && !localBindingShadowsAtUse(body2, netAlias, value, source) && nodeIsReachable(value, body2, source)) {
         const target = left[index] ?? left[0];
-        if (target?.type === "identifier") names.add(sourceText(target, source));
+        if (target?.type === "identifier") names.set(sourceText(target, source), assignment);
       }
     }
   }
@@ -21349,15 +21355,17 @@ function methodStopsField(method, source, fieldName) {
   const body2 = method.childForFieldName("body");
   const receiver = receiverName(method, source);
   if (body2 === null || receiver === void 0) return false;
-  const aliases = /* @__PURE__ */ new Set();
+  const aliases = /* @__PURE__ */ new Map();
   for (const declaration of directCallableDescendants(body2, "short_var_declaration")) {
     const left = declaration.childForFieldName("left")?.namedChildren ?? [];
     const right = declaration.childForFieldName("right")?.namedChildren ?? [];
     if (left.length !== 1 || right.length !== 1 || left[0]?.type !== "identifier") continue;
-    if (isReceiverField(right[0], source, receiver, fieldName)) aliases.add(sourceText(left[0], source));
+    if (isReceiverField(right[0], source, receiver, fieldName, body2)) {
+      aliases.set(sourceText(left[0], source), declaration);
+    }
   }
   return descendants(body2, "call_expression").some((call) => {
-    if (!callIsDefinitelyActive(call, body2)) return false;
+    if (!callIsDefinitelyActive(call, body2) || !nodeIsReachable(call, body2, source)) return false;
     const fn = call.childForFieldName("function");
     if (fn?.type !== "selector_expression") return false;
     const operand = fn.childForFieldName("operand");
@@ -21365,19 +21373,24 @@ function methodStopsField(method, source, fieldName) {
     if (operand === null || selected === null || !/^(?:Close|Shutdown|Stop)$/.test(sourceText(selected, source))) {
       return false;
     }
-    return isReceiverField(operand, source, receiver, fieldName) || operand.type === "identifier" && aliases.has(sourceText(operand, source));
+    if (isReceiverField(operand, source, receiver, fieldName, body2)) return true;
+    if (operand.type !== "identifier") return false;
+    const alias = sourceText(operand, source);
+    const declaration = aliases.get(alias);
+    return declaration !== void 0 && declaration.endIndex < call.startIndex && declarationScopeContainsUse(declaration, call) && !bindingChangesBetween(body2, alias, declaration.endIndex, call, source);
   });
 }
 function helperStopsListener(body2, source, listenerName) {
   return descendants(body2, "call_expression").some((call) => {
-    if (!callIsDefinitelyActive(call, body2)) return false;
+    if (!callIsDefinitelyActive(call, body2) || !nodeIsReachable(call, body2, source)) return false;
     const fn = call.childForFieldName("function");
     if (fn?.type !== "selector_expression") return false;
     const operand = fn.childForFieldName("operand");
     const field = fn.childForFieldName("field");
-    if (operand?.type !== "identifier" || field === null || sourceText(operand, source) !== listenerName) return false;
+    if (operand?.type !== "identifier" || field === null || sourceText(operand, source) !== listenerName || localBindingShadowsAtUse(body2, listenerName, operand, source)) return false;
     const selected = sourceText(field, source);
     if (!/^(?:Close|Shutdown|Stop)$/.test(selected)) return false;
+    if (bindingChangesBetween(body2, listenerName, body2.startIndex, call, source)) return false;
     return !insideDeferStatement(call);
   });
 }
@@ -21399,25 +21412,112 @@ function callIsDefinitelyActive(call, callableBody) {
   return current?.id === callableBody.id;
 }
 function defersListenerClose(body2, source, listenerName) {
-  return descendants(body2, "defer_statement").some((statement) => descendants(statement, "call_expression").some((call) => {
+  return descendants(body2, "defer_statement").some((statement) => nodeIsReachable(statement, body2, source) && descendants(statement, "call_expression").some((call) => {
+    if (!callIsDefinitelyActive(call, body2) || bindingChangesBetween(body2, listenerName, body2.startIndex, call, source)) return false;
     const fn = call.childForFieldName("function");
     if (fn?.type !== "selector_expression") return false;
     const operand = fn.childForFieldName("operand");
     const field = fn.childForFieldName("field");
-    return operand?.type === "identifier" && field !== null && sourceText(operand, source) === listenerName && sourceText(field, source) === "Close";
+    return operand?.type === "identifier" && field !== null && sourceText(operand, source) === listenerName && sourceText(field, source) === "Close" && !localBindingShadowsAtUse(body2, listenerName, operand, source);
   }));
 }
-function isHandlerServeMethod(node, source, receiver, fieldName) {
+function isHandlerServeMethod(node, source, receiver, fieldName, body2) {
   if (node.type !== "selector_expression") return false;
   const operand = node.childForFieldName("operand");
   const field = node.childForFieldName("field");
-  return operand !== null && field !== null && sourceText(field, source) === "Serve" && isReceiverField(operand, source, receiver, fieldName);
+  return operand !== null && field !== null && sourceText(field, source) === "Serve" && isReceiverField(operand, source, receiver, fieldName, body2);
 }
-function isReceiverField(node, source, receiver, fieldName) {
+function isReceiverField(node, source, receiver, fieldName, body2) {
   if (node.type !== "selector_expression") return false;
   const operand = node.childForFieldName("operand");
   const field = node.childForFieldName("field");
-  return operand?.type === "identifier" && field !== null && sourceText(operand, source) === receiver && sourceText(field, source) === fieldName;
+  return operand?.type === "identifier" && field !== null && sourceText(operand, source) === receiver && sourceText(field, source) === fieldName && (body2 === void 0 || !localBindingShadowsAtUse(body2, receiver, operand, source));
+}
+function localBindingShadowsAtUse(body2, name2, use, source) {
+  const declarations = [
+    ...descendants(body2, "short_var_declaration"),
+    ...descendants(body2, "var_spec"),
+    ...descendants(body2, "const_spec")
+  ];
+  return declarations.some((declaration) => declaration.startIndex < use.startIndex && bindingNames(declaration, source).includes(name2) && declarationScopeContainsUse(declaration, use));
+}
+function callableParameterNamed(body2, name2, source) {
+  const callable = body2.parent;
+  return callable !== null && callable.childForFieldName("body")?.id === body2.id && directParameters(callable).some((parameter) => declaredNames(parameter, source).includes(name2));
+}
+function declarationScopeContainsUse(declaration, use) {
+  const block = enclosingBlock(declaration);
+  if (block === null) return false;
+  let current = declaration.parent;
+  while (current !== null && current.id !== block.id) {
+    if ([
+      "if_statement",
+      "for_statement",
+      "expression_switch_statement",
+      "type_switch_statement",
+      "select_statement"
+    ].includes(current.type)) return containsNode(current, use);
+    current = current.parent;
+  }
+  return containsNode(block, use);
+}
+function bindingChangesBetween(body2, name2, startIndex, use, source) {
+  const changes = [
+    ...descendants(body2, "assignment_statement"),
+    ...descendants(body2, "short_var_declaration")
+  ];
+  return changes.some((change) => change.startIndex > startIndex && change.endIndex < use.startIndex && bindingNames(change, source).includes(name2) && declarationScopeContainsUse(change, use));
+}
+function bindingNames(node, source) {
+  if (node.type === "short_var_declaration" || node.type === "assignment_statement") {
+    const left = node.childForFieldName("left");
+    if (left === null) return [];
+    return descendants(left, "identifier").map((candidate) => sourceText(candidate, source));
+  }
+  return declaredNames(node, source);
+}
+function nodeIsReachable(node, callableBody, source) {
+  let current = node;
+  while (current !== null && current.id !== callableBody.id) {
+    const parent = current.parent;
+    if (parent === null) return false;
+    if (parent.type === "if_statement") {
+      const condition = parent.childForFieldName("condition");
+      const consequence = parent.childForFieldName("consequence");
+      const alternative = parent.childForFieldName("alternative");
+      const value = condition === null ? void 0 : staticBoolean(condition, source);
+      if (value === false && consequence !== null && containsNode(consequence, current) || value === true && alternative !== null && containsNode(alternative, current)) return false;
+    }
+    const statements = directStatements(parent);
+    const containingIndex = statements.findIndex((statement) => containsNode(statement, current));
+    if (containingIndex >= 0 && statements.slice(0, containingIndex).some(unconditionallyTerminates)) return false;
+    current = parent;
+  }
+  return current?.id === callableBody.id;
+}
+function directStatements(node) {
+  const list = node.namedChildren.find((child) => child.type === "statement_list");
+  return list?.namedChildren ?? (node.type === "block" || node.type.endsWith("_case") ? node.namedChildren : []);
+}
+function unconditionallyTerminates(statement) {
+  return statement.type === "return_statement" || statement.type === "goto_statement" || statement.type === "break_statement" || statement.type === "continue_statement";
+}
+function staticBoolean(node, source) {
+  const value = normalize(sourceText(node, source));
+  if (value === "false") return false;
+  if (value === "true") return true;
+  return void 0;
+}
+function enclosingBlock(node) {
+  let current = node.parent;
+  while (current !== null) {
+    if (current.type === "block" || current.type.endsWith("_case")) return current;
+    current = current.parent;
+  }
+  return null;
+}
+function containsNode(outer, inner) {
+  return outer.startIndex <= inner.startIndex && outer.endIndex >= inner.endIndex;
 }
 function directCallableDescendants(node, type) {
   const result = [];
@@ -21436,7 +21536,24 @@ function directCallableDescendants(node, type) {
 }
 function directParameters(callable) {
   const parameters = callable.childForFieldName("parameters");
-  return parameters === null ? [] : descendants(parameters, "parameter_declaration");
+  return parameters === null ? [] : parameters.namedChildren.filter((node) => node.type === "parameter_declaration" || node.type === "variadic_parameter_declaration");
+}
+function directParameterBindings(callable, source) {
+  const result = [];
+  let index = 0;
+  for (const parameter of directParameters(callable)) {
+    const type = parameter.childForFieldName("type");
+    const names = declaredNames(parameter, source);
+    if (names.length === 0) {
+      index += 1;
+      continue;
+    }
+    for (const name2 of names) {
+      result.push({ name: name2, type: sourceText(type ?? parameter, source), index });
+      index += 1;
+    }
+  }
+  return result;
 }
 function receiverName(method, source) {
   const receiver = method.childForFieldName("receiver");
@@ -21479,10 +21596,10 @@ function aliasForPath(imports, path) {
   for (const [alias, candidate] of imports) if (candidate === path) return alias;
   return void 0;
 }
-function importResolvesTo(importPath, target) {
-  const directory = target.directory === "." ? "" : target.directory;
-  const directoryMatch = directory === "" || importPath === directory || importPath.endsWith(`/${directory}`);
-  return directoryMatch && posix.basename(importPath) === target.packageName;
+function importResolvesTo(importPath, target, modulePath) {
+  if (modulePath === void 0) return false;
+  const expected = target.directory === "." ? modulePath : `${modulePath}/${target.directory}`;
+  return importPath === expected && posix.basename(importPath) === target.packageName;
 }
 function samePackage(left, right) {
   return left.directory === right.directory && left.packageName === right.packageName;
@@ -23948,12 +24065,14 @@ function stablePositives(positives) {
 
 // src/discover.ts
 import { execFile } from "node:child_process";
+import { readFile as readFile4 } from "node:fs/promises";
+import { join as join4 } from "node:path";
 import { promisify } from "node:util";
 var MAX_FILE_BYTES = 75e4;
 var MAX_FILES = 750;
 var execute = promisify(execFile);
 function includePath(path) {
-  return path.endsWith(".go");
+  return path.endsWith(".go") || path === "go.mod";
 }
 async function discoverSources(ctx) {
   const sources = await ctx.loadInScopeSources({
@@ -23961,9 +24080,11 @@ async function discoverSources(ctx) {
     limit: MAX_FILES,
     maxBytes: MAX_FILE_BYTES
   });
+  const modulePath = modulePathFromSources(sources) ?? await modulePathFromRepository(ctx.repoPath);
+  const goSources = sources.filter((source) => source.path.endsWith(".go"));
   const wholeTarget = ctx.change === null || ctx.change.scanMode === "all";
   const files = [];
-  for (const source of sources) {
+  for (const source of goSources) {
     if (wholeTarget || source.status === "repository") {
       files.push({
         path: source.path,
@@ -23985,8 +24106,24 @@ async function discoverSources(ctx) {
   return {
     mode: wholeTarget ? "repository" : "diff",
     ...ctx.change?.baseRef === void 0 ? {} : { base: ctx.change.baseRef },
+    ...modulePath === void 0 ? {} : { modulePath },
     files
   };
+}
+function modulePathFromSources(sources) {
+  const module2 = sources.find((source) => source.path === "go.mod");
+  if (module2 === void 0) return void 0;
+  return modulePathFromText(module2.content);
+}
+async function modulePathFromRepository(repoPath) {
+  try {
+    return modulePathFromText(await readFile4(join4(repoPath, "go.mod"), "utf8"));
+  } catch {
+    return void 0;
+  }
+}
+function modulePathFromText(content) {
+  return /^\s*module\s+([^\s/][^\s]*)\s*$/m.exec(content)?.[1];
 }
 async function changedSource(repoPath, change, path) {
   const base = change?.baseRef;

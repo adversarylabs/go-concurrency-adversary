@@ -21,7 +21,9 @@ interface AsyncListenerHelper {
   parsed: ParsedFile;
   name: string;
   listenerParameter: string;
+  listenerParameterIndex: number;
   callbackParameter: string;
+  callbackParameterIndex: number;
   goStatement: Node;
   callbackCall: Node;
 }
@@ -59,8 +61,8 @@ export async function analyzeAsyncListenerOwnership(discovery: Discovery): Promi
     ? await parseRelevantFiles(discovery.files, true)
     : [];
   try {
-    const currentFacts = collectFacts(current);
-    const previousSignatures = new Set(collectFacts(previous).map((fact) => fact.signature));
+    const currentFacts = collectFacts(current, discovery.modulePath);
+    const previousSignatures = new Set(collectFacts(previous, discovery.modulePath).map((fact) => fact.signature));
     const signals: Signal[] = [];
     for (const fact of currentFacts) {
       if (discovery.mode === "diff" && previousSignatures.has(fact.signature)) continue;
@@ -109,7 +111,7 @@ async function parseRelevantFiles(files: SourceRevision[], previous: boolean): P
   return parsed;
 }
 
-function collectFacts(files: ParsedFile[]): AsyncListenerFact[] {
+function collectFacts(files: ParsedFile[], modulePath: string | undefined): AsyncListenerFact[] {
   const helpers = files.flatMap(collectAsyncHelpers);
   const serverTypes = files.flatMap(collectHTTPServerTypes);
   const methods = files.flatMap((parsed) =>
@@ -130,18 +132,24 @@ function collectFacts(files: ParsedFile[]): AsyncListenerFact[] {
       if (body === null) continue;
       const receiver = receiverName(method, parsed.file.current);
       if (receiver === undefined) continue;
-      const listenerNames = listenerVariables(body, parsed);
-      if (listenerNames.size === 0) continue;
+      const listenerOrigins = listenerVariables(body, parsed);
+      if (listenerOrigins.size === 0) continue;
 
       for (const call of directCallableDescendants(body, "call_expression")) {
-        const helper = resolveAsyncHelper(call, parsed, helpers);
+        if (!nodeIsReachable(call, body, parsed.file.current)) continue;
+        const helper = resolveAsyncHelper(call, parsed, helpers, modulePath, body);
         if (helper === undefined) continue;
         const args = call.childForFieldName("arguments")?.namedChildren ?? [];
-        const listener = args.find((arg) =>
-          arg.type === "identifier" && listenerNames.has(sourceText(arg, parsed.file.current)));
-        const serveMethod = args.find((arg) =>
-          isHandlerServeMethod(arg, parsed.file.current, receiver, server.handlerField));
-        if (listener === undefined || serveMethod === undefined) continue;
+        const listener = args[helper.listenerParameterIndex];
+        const serveMethod = args[helper.callbackParameterIndex];
+        const listenerName = listener?.type === "identifier"
+          ? sourceText(listener, parsed.file.current)
+          : undefined;
+        const listenerOrigin = listenerName === undefined ? undefined : listenerOrigins.get(listenerName);
+        if (listener?.type !== "identifier" || listenerOrigin === undefined ||
+            bindingChangesBetween(body, listenerName!, listenerOrigin.endIndex, call, parsed.file.current) ||
+            serveMethod === undefined ||
+            !isHandlerServeMethod(serveMethod, parsed.file.current, receiver, server.handlerField, body)) continue;
         const evidence: EvidenceNode[] = [
           { parsed: server.parsed, node: server.field },
           { parsed, node: method.childForFieldName("name") ?? method },
@@ -159,7 +167,8 @@ function collectFacts(files: ParsedFile[]): AsyncListenerFact[] {
           helper.parsed.directory,
           helper.parsed.packageName,
           helper.name,
-          semantic(sourceText(call, parsed.file.current)),
+          semantic(sourceText(listener, parsed.file.current)),
+          semantic(sourceText(serveMethod, parsed.file.current)),
         ].join("|");
         facts.push({ signature, server, startMethod: method, helper, asyncCall: call, evidence });
       }
@@ -204,37 +213,43 @@ function collectAsyncHelpers(parsed: ParsedFile): AsyncListenerHelper[] {
     const name = fn.childForFieldName("name");
     const body = fn.childForFieldName("body");
     if (name === null || body === null) continue;
-    const parameters = directParameters(fn);
-    const listener = parameters.find((parameter) =>
-      normalize(sourceText(parameter.childForFieldName("type") ?? parameter, source)) === `${netAlias}.Listener`);
+    const parameters = directParameterBindings(fn, source);
+    const listener = parameters.find((parameter) => normalize(parameter.type) === `${netAlias}.Listener`);
     const callback = parameters.find((parameter) =>
-      normalize(sourceText(parameter.childForFieldName("type") ?? parameter, source)) ===
-        `func${netAlias}.Listenererror`);
-    const listenerName = listener === undefined ? undefined : declaredNames(listener, source)[0];
-    const callbackName = callback === undefined ? undefined : declaredNames(callback, source)[0];
-    if (listenerName === undefined || callbackName === undefined) continue;
+      normalize(parameter.type) === `func${netAlias}.Listenererror`);
+    if (listener === undefined || callback === undefined) continue;
+    const listenerName = listener.name;
+    const callbackName = callback.name;
     // A helper that directly stops the listener owns shutdown itself. Merely
     // observing cancellation does not release the listener or serving goroutine.
     if (helperStopsListener(body, source, listenerName)) continue;
 
     for (const goStatement of directCallableDescendants(body, "go_statement")) {
+      if (!nodeIsReachable(goStatement, body, source)) continue;
+      if (bindingChangesBetween(body, listenerName, body.startIndex, goStatement, source) ||
+          bindingChangesBetween(body, callbackName, body.startIndex, goStatement, source)) continue;
       const invocation = goStatement.namedChildren.find((node) => node.type === "call_expression");
       const literal = invocation?.childForFieldName("function");
       if (literal?.type !== "func_literal") continue;
       const literalBody = literal.childForFieldName("body");
       if (literalBody === null) continue;
       const callbackCall = directCallableDescendants(literalBody, "call_expression").find((call) => {
+        if (!nodeIsReachable(call, literalBody, source)) return false;
         const called = call.childForFieldName("function");
         const args = call.childForFieldName("arguments")?.namedChildren ?? [];
         return called?.type === "identifier" && sourceText(called, source) === callbackName &&
-          args.length === 1 && args[0]?.type === "identifier" && sourceText(args[0], source) === listenerName;
+          !localBindingShadowsAtUse(literalBody, callbackName, call, source) &&
+          args.length === 1 && args[0]?.type === "identifier" && sourceText(args[0], source) === listenerName &&
+          !localBindingShadowsAtUse(literalBody, listenerName, args[0], source);
       });
       if (callbackCall === undefined || !defersListenerClose(literalBody, source, listenerName)) continue;
       helpers.push({
         parsed,
         name: sourceText(name, source),
         listenerParameter: listenerName,
+        listenerParameterIndex: listener.index,
         callbackParameter: callbackName,
+        callbackParameterIndex: callback.index,
         goStatement,
         callbackCall,
       });
@@ -247,20 +262,27 @@ function resolveAsyncHelper(
   call: Node,
   caller: ParsedFile,
   helpers: AsyncListenerHelper[],
+  modulePath: string | undefined,
+  callerBody: Node,
 ): AsyncListenerHelper | undefined {
   const fn = call.childForFieldName("function");
   if (fn?.type === "identifier") {
     const name = sourceText(fn, caller.file.current);
+    if (callableParameterNamed(callerBody, name, caller.file.current) ||
+        localBindingShadowsAtUse(callerBody, name, call, caller.file.current)) return undefined;
     return helpers.find((helper) => helper.name === name && samePackage(helper.parsed, caller));
   }
   if (fn?.type !== "selector_expression") return undefined;
   const operand = fn.childForFieldName("operand");
   const field = fn.childForFieldName("field");
   if (operand?.type !== "identifier" || field === null) return undefined;
-  const importPath = caller.importsByAlias.get(sourceText(operand, caller.file.current));
+  const alias = sourceText(operand, caller.file.current);
+  if (callableParameterNamed(callerBody, alias, caller.file.current) ||
+      localBindingShadowsAtUse(callerBody, alias, call, caller.file.current)) return undefined;
+  const importPath = caller.importsByAlias.get(alias);
   if (importPath === undefined) return undefined;
   const name = sourceText(field, caller.file.current);
-  return helpers.find((helper) => helper.name === name && importResolvesTo(importPath, helper.parsed));
+  return helpers.find((helper) => helper.name === name && importResolvesTo(importPath, helper.parsed, modulePath));
 }
 
 function startContract(method: Node, parsed: ParsedFile): boolean {
@@ -275,17 +297,11 @@ function startContract(method: Node, parsed: ParsedFile): boolean {
     .test(sourceText(result, source));
 }
 
-function listenerVariables(body: Node, parsed: ParsedFile): Set<string> {
+function listenerVariables(body: Node, parsed: ParsedFile): Map<string, Node> {
   const source = parsed.file.current;
   const netAlias = aliasForPath(parsed.importsByAlias, "net");
-  if (netAlias === undefined) return new Set();
-  const names = new Set<string>();
-  for (const spec of directCallableDescendants(body, "var_spec")) {
-    const type = spec.childForFieldName("type");
-    if (type !== null && normalize(sourceText(type, source)) === `${netAlias}.Listener`) {
-      for (const name of declaredNames(spec, source)) names.add(name);
-    }
-  }
+  if (netAlias === undefined) return new Map();
+  const names = new Map<string, Node>();
   for (const assignment of directCallableDescendants(body, "short_var_declaration")) {
     const left = assignment.childForFieldName("left")?.namedChildren ?? [];
     const right = assignment.childForFieldName("right")?.namedChildren ?? [];
@@ -293,9 +309,14 @@ function listenerVariables(body: Node, parsed: ParsedFile): Set<string> {
       const value = right[index];
       if (value?.type !== "call_expression") continue;
       const fn = value.childForFieldName("function");
-      if (fn !== null && normalize(sourceText(fn, source)) === `${netAlias}.Listen`) {
+      if (fn?.type === "selector_expression" &&
+          sourceText(fn.childForFieldName("operand") ?? fn, source) === netAlias &&
+          sourceText(fn.childForFieldName("field") ?? fn, source) === "Listen" &&
+          !callableParameterNamed(body, netAlias, source) &&
+          !localBindingShadowsAtUse(body, netAlias, value, source) &&
+          nodeIsReachable(value, body, source)) {
         const target = left[index] ?? left[0];
-        if (target?.type === "identifier") names.add(sourceText(target, source));
+        if (target?.type === "identifier") names.set(sourceText(target, source), assignment);
       }
     }
   }
@@ -306,19 +327,21 @@ function methodStopsField(method: Node, source: string, fieldName: string): bool
   const body = method.childForFieldName("body");
   const receiver = receiverName(method, source);
   if (body === null || receiver === undefined) return false;
-  const aliases = new Set<string>();
+  const aliases = new Map<string, Node>();
   for (const declaration of directCallableDescendants(body, "short_var_declaration")) {
     const left = declaration.childForFieldName("left")?.namedChildren ?? [];
     const right = declaration.childForFieldName("right")?.namedChildren ?? [];
     if (left.length !== 1 || right.length !== 1 || left[0]?.type !== "identifier") continue;
-    if (isReceiverField(right[0]!, source, receiver, fieldName)) aliases.add(sourceText(left[0], source));
+    if (isReceiverField(right[0]!, source, receiver, fieldName, body)) {
+      aliases.set(sourceText(left[0], source), declaration);
+    }
   }
   // Any syntactic close/shutdown path on the owned field is enough to stay
   // quiet here. Proving that path is wired into daemon shutdown is a broader
   // ownership question; this rule is specifically for the complete absence of
   // a stop mechanism.
   return descendants(body, "call_expression").some((call) => {
-    if (!callIsDefinitelyActive(call, body)) return false;
+    if (!callIsDefinitelyActive(call, body) || !nodeIsReachable(call, body, source)) return false;
     const fn = call.childForFieldName("function");
     if (fn?.type !== "selector_expression") return false;
     const operand = fn.childForFieldName("operand");
@@ -326,21 +349,28 @@ function methodStopsField(method: Node, source: string, fieldName: string): bool
     if (operand === null || selected === null || !/^(?:Close|Shutdown|Stop)$/.test(sourceText(selected, source))) {
       return false;
     }
-    return isReceiverField(operand, source, receiver, fieldName) ||
-      (operand.type === "identifier" && aliases.has(sourceText(operand, source)));
+    if (isReceiverField(operand, source, receiver, fieldName, body)) return true;
+    if (operand.type !== "identifier") return false;
+    const alias = sourceText(operand, source);
+    const declaration = aliases.get(alias);
+    return declaration !== undefined && declaration.endIndex < call.startIndex &&
+      declarationScopeContainsUse(declaration, call) &&
+      !bindingChangesBetween(body, alias, declaration.endIndex, call, source);
   });
 }
 
 function helperStopsListener(body: Node, source: string, listenerName: string): boolean {
   return descendants(body, "call_expression").some((call) => {
-    if (!callIsDefinitelyActive(call, body)) return false;
+    if (!callIsDefinitelyActive(call, body) || !nodeIsReachable(call, body, source)) return false;
     const fn = call.childForFieldName("function");
     if (fn?.type !== "selector_expression") return false;
     const operand = fn.childForFieldName("operand");
     const field = fn.childForFieldName("field");
-    if (operand?.type !== "identifier" || field === null || sourceText(operand, source) !== listenerName) return false;
+    if (operand?.type !== "identifier" || field === null || sourceText(operand, source) !== listenerName ||
+        localBindingShadowsAtUse(body, listenerName, operand, source)) return false;
     const selected = sourceText(field, source);
     if (!/^(?:Close|Shutdown|Stop)$/.test(selected)) return false;
+    if (bindingChangesBetween(body, listenerName, body.startIndex, call, source)) return false;
     // The exact helper defers listener.Close inside the serving goroutine. That
     // releases the socket only after Serve returns; it is not a stop path.
     return !insideDeferStatement(call);
@@ -367,30 +397,149 @@ function callIsDefinitelyActive(call: Node, callableBody: Node): boolean {
 
 function defersListenerClose(body: Node, source: string, listenerName: string): boolean {
   return descendants(body, "defer_statement").some((statement) =>
-    descendants(statement, "call_expression").some((call) => {
+    nodeIsReachable(statement, body, source) && descendants(statement, "call_expression").some((call) => {
+      if (!callIsDefinitelyActive(call, body) ||
+          bindingChangesBetween(body, listenerName, body.startIndex, call, source)) return false;
       const fn = call.childForFieldName("function");
       if (fn?.type !== "selector_expression") return false;
       const operand = fn.childForFieldName("operand");
       const field = fn.childForFieldName("field");
       return operand?.type === "identifier" && field !== null &&
-        sourceText(operand, source) === listenerName && sourceText(field, source) === "Close";
+        sourceText(operand, source) === listenerName && sourceText(field, source) === "Close" &&
+        !localBindingShadowsAtUse(body, listenerName, operand, source);
     }));
 }
 
-function isHandlerServeMethod(node: Node, source: string, receiver: string, fieldName: string): boolean {
+function isHandlerServeMethod(
+  node: Node,
+  source: string,
+  receiver: string,
+  fieldName: string,
+  body: Node,
+): boolean {
   if (node.type !== "selector_expression") return false;
   const operand = node.childForFieldName("operand");
   const field = node.childForFieldName("field");
   return operand !== null && field !== null && sourceText(field, source) === "Serve" &&
-    isReceiverField(operand, source, receiver, fieldName);
+    isReceiverField(operand, source, receiver, fieldName, body);
 }
 
-function isReceiverField(node: Node, source: string, receiver: string, fieldName: string): boolean {
+function isReceiverField(
+  node: Node,
+  source: string,
+  receiver: string,
+  fieldName: string,
+  body?: Node,
+): boolean {
   if (node.type !== "selector_expression") return false;
   const operand = node.childForFieldName("operand");
   const field = node.childForFieldName("field");
   return operand?.type === "identifier" && field !== null &&
-    sourceText(operand, source) === receiver && sourceText(field, source) === fieldName;
+    sourceText(operand, source) === receiver && sourceText(field, source) === fieldName &&
+    (body === undefined || !localBindingShadowsAtUse(body, receiver, operand, source));
+}
+
+function localBindingShadowsAtUse(body: Node, name: string, use: Node, source: string): boolean {
+  const declarations = [
+    ...descendants(body, "short_var_declaration"),
+    ...descendants(body, "var_spec"),
+    ...descendants(body, "const_spec"),
+  ];
+  return declarations.some((declaration) => declaration.startIndex < use.startIndex &&
+    bindingNames(declaration, source).includes(name) && declarationScopeContainsUse(declaration, use));
+}
+
+function callableParameterNamed(body: Node, name: string, source: string): boolean {
+  const callable = body.parent;
+  return callable !== null && callable.childForFieldName("body")?.id === body.id &&
+    directParameters(callable).some((parameter) => declaredNames(parameter, source).includes(name));
+}
+
+function declarationScopeContainsUse(declaration: Node, use: Node): boolean {
+  const block = enclosingBlock(declaration);
+  if (block === null) return false;
+  let current = declaration.parent;
+  while (current !== null && current.id !== block.id) {
+    if (["if_statement", "for_statement", "expression_switch_statement", "type_switch_statement",
+      "select_statement"].includes(current.type)) return containsNode(current, use);
+    current = current.parent;
+  }
+  return containsNode(block, use);
+}
+
+function bindingChangesBetween(
+  body: Node,
+  name: string,
+  startIndex: number,
+  use: Node,
+  source: string,
+): boolean {
+  const changes = [
+    ...descendants(body, "assignment_statement"),
+    ...descendants(body, "short_var_declaration"),
+  ];
+  return changes.some((change) => change.startIndex > startIndex && change.endIndex < use.startIndex &&
+    bindingNames(change, source).includes(name) && declarationScopeContainsUse(change, use));
+}
+
+function bindingNames(node: Node, source: string): string[] {
+  if (node.type === "short_var_declaration" || node.type === "assignment_statement") {
+    const left = node.childForFieldName("left");
+    if (left === null) return [];
+    return descendants(left, "identifier").map((candidate) => sourceText(candidate, source));
+  }
+  return declaredNames(node, source);
+}
+
+function nodeIsReachable(node: Node, callableBody: Node, source: string): boolean {
+  let current: Node | null = node;
+  while (current !== null && current.id !== callableBody.id) {
+    const parent: Node | null = current.parent;
+    if (parent === null) return false;
+    if (parent.type === "if_statement") {
+      const condition = parent.childForFieldName("condition");
+      const consequence = parent.childForFieldName("consequence");
+      const alternative = parent.childForFieldName("alternative");
+      const value = condition === null ? undefined : staticBoolean(condition, source);
+      if ((value === false && consequence !== null && containsNode(consequence, current)) ||
+          (value === true && alternative !== null && containsNode(alternative, current))) return false;
+    }
+    const statements = directStatements(parent);
+    const containingIndex = statements.findIndex((statement) => containsNode(statement, current!));
+    if (containingIndex >= 0 && statements.slice(0, containingIndex).some(unconditionallyTerminates)) return false;
+    current = parent;
+  }
+  return current?.id === callableBody.id;
+}
+
+function directStatements(node: Node): Node[] {
+  const list = node.namedChildren.find((child) => child.type === "statement_list");
+  return list?.namedChildren ?? (node.type === "block" || node.type.endsWith("_case") ? node.namedChildren : []);
+}
+
+function unconditionallyTerminates(statement: Node): boolean {
+  return statement.type === "return_statement" || statement.type === "goto_statement" ||
+    statement.type === "break_statement" || statement.type === "continue_statement";
+}
+
+function staticBoolean(node: Node, source: string): boolean | undefined {
+  const value = normalize(sourceText(node, source));
+  if (value === "false") return false;
+  if (value === "true") return true;
+  return undefined;
+}
+
+function enclosingBlock(node: Node): Node | null {
+  let current = node.parent;
+  while (current !== null) {
+    if (current.type === "block" || current.type.endsWith("_case")) return current;
+    current = current.parent;
+  }
+  return null;
+}
+
+function containsNode(outer: Node, inner: Node): boolean {
+  return outer.startIndex <= inner.startIndex && outer.endIndex >= inner.endIndex;
 }
 
 function directCallableDescendants(node: Node, type: string): Node[] {
@@ -411,7 +560,26 @@ function directCallableDescendants(node: Node, type: string): Node[] {
 
 function directParameters(callable: Node): Node[] {
   const parameters = callable.childForFieldName("parameters");
-  return parameters === null ? [] : descendants(parameters, "parameter_declaration");
+  return parameters === null ? [] : parameters.namedChildren.filter((node) =>
+    node.type === "parameter_declaration" || node.type === "variadic_parameter_declaration");
+}
+
+function directParameterBindings(callable: Node, source: string): Array<{ name: string; type: string; index: number }> {
+  const result: Array<{ name: string; type: string; index: number }> = [];
+  let index = 0;
+  for (const parameter of directParameters(callable)) {
+    const type = parameter.childForFieldName("type");
+    const names = declaredNames(parameter, source);
+    if (names.length === 0) {
+      index += 1;
+      continue;
+    }
+    for (const name of names) {
+      result.push({ name, type: sourceText(type ?? parameter, source), index });
+      index += 1;
+    }
+  }
+  return result;
 }
 
 function receiverName(method: Node, source: string): string | undefined {
@@ -466,10 +634,10 @@ function aliasForPath(imports: Map<string, string>, path: string): string | unde
   return undefined;
 }
 
-function importResolvesTo(importPath: string, target: ParsedFile): boolean {
-  const directory = target.directory === "." ? "" : target.directory;
-  const directoryMatch = directory === "" || importPath === directory || importPath.endsWith(`/${directory}`);
-  return directoryMatch && posix.basename(importPath) === target.packageName;
+function importResolvesTo(importPath: string, target: ParsedFile, modulePath: string | undefined): boolean {
+  if (modulePath === undefined) return false;
+  const expected = target.directory === "." ? modulePath : `${modulePath}/${target.directory}`;
+  return importPath === expected && posix.basename(importPath) === target.packageName;
 }
 
 function samePackage(left: ParsedFile, right: ParsedFile): boolean {

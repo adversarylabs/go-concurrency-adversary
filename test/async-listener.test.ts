@@ -73,6 +73,136 @@ test("requires the imported helper to resolve to the proven package", async () =
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
 });
 
+test("binds the owned listener and Serve callback to the helper's exact parameter positions", async () => {
+  const files = vulnerableProject();
+  files["plugins/server/internal/serve.go"] = `package internal
+
+import "net"
+
+func Serve(actual net.Listener, actualServe func(net.Listener) error, decoy net.Listener, decoyServe func(net.Listener) error) {
+  go func() {
+    defer actual.Close()
+    _ = actualServe(actual)
+  }()
+}
+`;
+  files["plugins/server/debug/plugin.go"] = files["plugins/server/debug/plugin.go"]!
+    .replace(
+      "listener, err := net.Listen(\"tcp\", \":0\")",
+      `actual, err := net.Listen("tcp", ":0")
+  if err != nil { return err }
+  listener, err := net.Listen("tcp", ":0")`,
+    )
+    .replace(
+      "internal.Serve(ctx, listener, s.handler.Serve)",
+      "internal.Serve(actual, func(net.Listener) error { return nil }, listener, s.handler.Serve)",
+    );
+  const output = await review(await repository(files));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
+test("requires an unshadowed standard net.Listen creation", async () => {
+  const typedNil = vulnerableProject();
+  typedNil["plugins/server/debug/plugin.go"] = typedNil["plugins/server/debug/plugin.go"]!
+    .replace(
+      `listener, err := net.Listen("tcp", ":0")
+  if err != nil { return err }`,
+      "var listener net.Listener",
+    );
+  const shadowed = vulnerableProject();
+  shadowed["plugins/server/debug/plugin.go"] = shadowed["plugins/server/debug/plugin.go"]!
+    .replace(
+      "listener, err := net.Listen(\"tcp\", \":0\")",
+      "net := fakeNet{}\n  listener, err := net.Listen(\"tcp\", \":0\")",
+    ) + `
+type fakeNet struct{}
+func (fakeNet) Listen(string, string) (net.Listener, error) { return nil, nil }
+`;
+  for (const files of [typedNil, shadowed]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+  }
+});
+
+test("requires reachable callback, cleanup, and exact owner bindings", async () => {
+  const deadCallback = vulnerableProject();
+  deadCallback["plugins/server/internal/serve.go"] = deadCallback["plugins/server/internal/serve.go"]!
+    .replace("    _ = serve(listener)", "    if false { _ = serve(listener) }");
+  const deadHelperStop = vulnerableProject();
+  deadHelperStop["plugins/server/internal/serve.go"] = deadHelperStop["plugins/server/internal/serve.go"]!
+    .replace("  _ = ctx", "  if false { _ = listener.Close() }");
+  const reassignedAlias = vulnerableProject();
+  reassignedAlias["plugins/server/debug/plugin.go"] += `
+func (s server) Close(other *http.Server) error {
+  owned := s.handler
+  owned = other
+  return owned.Close()
+}
+`;
+  const shadowedReceiver = vulnerableProject();
+  shadowedReceiver["plugins/server/debug/plugin.go"] = shadowedReceiver["plugins/server/debug/plugin.go"]!
+    .replace(
+      "listener, err := net.Listen(\"tcp\", \":0\")",
+      "s := server{handler: &http.Server{}}\n  listener, err := net.Listen(\"tcp\", \":0\")",
+    );
+
+  assert.equal((await review(await repository(deadCallback))).findings.some((item) => item.ruleId === ruleId), false);
+  for (const files of [deadHelperStop, reassignedAlias]) {
+    assert.equal((await review(await repository(files))).findings.some((item) => item.ruleId === ruleId), true);
+  }
+  assert.equal((await review(await repository(shadowedReceiver))).findings.some((item) => item.ruleId === ruleId), false);
+});
+
+test("rejects helper parameters reassigned before the asynchronous call", async () => {
+  const listenerReassigned = vulnerableProject();
+  listenerReassigned["plugins/server/internal/serve.go"] = listenerReassigned["plugins/server/internal/serve.go"]!
+    .replace("  go func() {", "  listener = nil\n  go func() {");
+  const callbackReassigned = vulnerableProject();
+  callbackReassigned["plugins/server/internal/serve.go"] = callbackReassigned["plugins/server/internal/serve.go"]!
+    .replace("  go func() {", "  serve = func(net.Listener) error { return nil }\n  go func() {");
+
+  for (const files of [listenerReassigned, callbackReassigned]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+  }
+});
+
+test("requires reachable calls and unshadowed helper bindings", async () => {
+  const deadHelperCall = vulnerableProject();
+  deadHelperCall["plugins/server/debug/plugin.go"] = deadHelperCall["plugins/server/debug/plugin.go"]!
+    .replace(
+      "internal.Serve(ctx, listener, s.handler.Serve)",
+      "if false { internal.Serve(ctx, listener, s.handler.Serve) }",
+    );
+  const reassignedListener = vulnerableProject();
+  reassignedListener["plugins/server/debug/plugin.go"] = reassignedListener["plugins/server/debug/plugin.go"]!
+    .replace(
+      "internal.Serve(ctx, listener, s.handler.Serve)",
+      "listener = nil\n  internal.Serve(ctx, listener, s.handler.Serve)",
+    );
+  const shadowedHelper = vulnerableProject();
+  shadowedHelper["plugins/server/debug/plugin.go"] = shadowedHelper["plugins/server/debug/plugin.go"]!
+    .replace(
+      "internal.Serve(ctx, listener, s.handler.Serve)",
+      "internal := fakeInternal{}\n  internal.Serve(ctx, listener, s.handler.Serve)",
+    ) + `
+type fakeInternal struct{}
+func (fakeInternal) Serve(context.Context, net.Listener, func(net.Listener) error) {}
+`;
+
+  for (const files of [deadHelperCall, reassignedListener, shadowedHelper]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+  }
+});
+
+test("fails closed for a cross-package helper when module identity is unavailable", async () => {
+  const files = vulnerableProject();
+  delete files["go.mod"];
+  const output = await review(await repository(files));
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
 test("accepts an explicit listener stop path and a one-step server alias", async () => {
   const direct = vulnerableProject();
   direct["plugins/server/internal/serve.go"] = direct["plugins/server/internal/serve.go"]!.replace(
@@ -182,6 +312,23 @@ test("a changed helper that introduces the goroutine is eligible evidence", asyn
   assert.match(finding?.evidence[0]?.snippet ?? "", /go func/);
 });
 
+test("an unrelated context-argument edit does not resurface an existing lifecycle", async () => {
+  const files = vulnerableProject();
+  const root = await repository(files, true);
+  await writeFile(
+    join(root, "plugins/server/debug/plugin.go"),
+    files["plugins/server/debug/plugin.go"]!.replace(
+      "internal.Serve(ctx, listener, s.handler.Serve)",
+      "internal.Serve(context.WithoutCancel(ctx), listener, s.handler.Serve)",
+    ),
+  );
+  const output = await changedReview(root, [
+    "plugins/server/debug/plugin.go",
+    "plugins/server/internal/serve.go",
+  ]);
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+});
+
 async function review(root: string) {
   return createApp().run({ input: { source: { path: root } } });
 }
@@ -221,6 +368,7 @@ async function repository(files: Record<string, string>, commit = false): Promis
 
 function vulnerableProject(): Record<string, string> {
   return {
+    "go.mod": "module example.com/project\n\ngo 1.24\n",
     "plugins/server/internal/serve.go": `package internal
 
 import (

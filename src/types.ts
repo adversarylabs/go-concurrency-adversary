@@ -16,6 +16,7 @@ export interface Discovery {
   base?: string;
   files: SourceRevision[];
   goVersion?: GoVersion;
+  modulePath?: string;
 }
 
 export interface Signal {

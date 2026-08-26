@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ChangeContext, RuleContext } from "@adversarylabs/sdk";
 import { type Discovery, type SourceRevision } from "./types.js";
@@ -8,7 +10,7 @@ const MAX_FILES = 750;
 const execute = promisify(execFile);
 
 function includePath(path: string): boolean {
-  return path.endsWith(".go");
+  return path.endsWith(".go") || path === "go.mod";
 }
 
 export async function discoverSources(ctx: RuleContext): Promise<Discovery> {
@@ -18,9 +20,11 @@ export async function discoverSources(ctx: RuleContext): Promise<Discovery> {
     maxBytes: MAX_FILE_BYTES,
   });
 
+  const modulePath = modulePathFromSources(sources) ?? await modulePathFromRepository(ctx.repoPath);
+  const goSources = sources.filter((source) => source.path.endsWith(".go"));
   const wholeTarget = ctx.change === null || ctx.change.scanMode === "all";
   const files: SourceRevision[] = [];
-  for (const source of sources) {
+  for (const source of goSources) {
     if (wholeTarget || source.status === "repository") {
       files.push({
         path: source.path,
@@ -44,6 +48,7 @@ export async function discoverSources(ctx: RuleContext): Promise<Discovery> {
   return {
     mode: wholeTarget ? "repository" : "diff",
     ...(ctx.change?.baseRef === undefined ? {} : { base: ctx.change.baseRef }),
+    ...(modulePath === undefined ? {} : { modulePath }),
     files,
   };
 }
@@ -60,9 +65,11 @@ export async function discoverGoSources(
     limit: MAX_FILES,
     maxBytes: MAX_FILE_BYTES,
   });
+  const modulePath = modulePathFromSources(sources) ?? await modulePathFromRepository(repoPath);
+  const goSources = sources.filter((source) => source.path.endsWith(".go"));
   const wholeTarget = change === null || change.scanMode === "all";
   const files: SourceRevision[] = [];
-  for (const source of sources) {
+  for (const source of goSources) {
     if (wholeTarget || source.status === "repository") {
       files.push({
         path: source.path,
@@ -85,8 +92,27 @@ export async function discoverGoSources(
   return {
     mode: wholeTarget ? "repository" : "diff",
     ...(change?.baseRef === undefined ? {} : { base: change.baseRef }),
+    ...(modulePath === undefined ? {} : { modulePath }),
     files,
   };
+}
+
+function modulePathFromSources(sources: Array<{ path: string; content: string }>): string | undefined {
+  const module = sources.find((source) => source.path === "go.mod");
+  if (module === undefined) return undefined;
+  return modulePathFromText(module.content);
+}
+
+async function modulePathFromRepository(repoPath: string): Promise<string | undefined> {
+  try {
+    return modulePathFromText(await readFile(join(repoPath, "go.mod"), "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function modulePathFromText(content: string): string | undefined {
+  return /^\s*module\s+([^\s/][^\s]*)\s*$/m.exec(content)?.[1];
 }
 
 async function changedSource(

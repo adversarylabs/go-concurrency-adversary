@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,19 +16,26 @@ test("the published runtime executes without node_modules", async () => {
   const entrypoint = join(artifact, "dist", "index.js");
   const input = join(artifact, "input.json");
   const output = join(artifact, "output.json");
+  const archive = join(artifact, "package.tar");
 
-  await mkdir(dirname(entrypoint), { recursive: true });
-  await mkdir(join(artifact, "schemas"), { recursive: true });
-  await copyFile(join(projectRoot, "dist", "index.js"), entrypoint);
-  await copyFile(join(projectRoot, "dist", "web-tree-sitter.wasm"), join(artifact, "dist", "web-tree-sitter.wasm"));
-  await copyFile(join(projectRoot, "dist", "tree-sitter-go.wasm"), join(artifact, "dist", "tree-sitter-go.wasm"));
-  await copyFile(
-    join(projectRoot, "schemas", "adversary.review.v1.schema.json"),
-    join(artifact, "schemas", "adversary.review.v1.schema.json"),
-  );
-  await copyFile(join(projectRoot, "THIRD_PARTY_NOTICES.md"), join(artifact, "THIRD_PARTY_NOTICES.md"));
-  await writeFile(join(artifact, "package.json"), '{"type":"module"}\n');
+  for (const path of ["dist/web-tree-sitter.wasm", "dist/tree-sitter-go.wasm"]) {
+    await execute("git", ["ls-files", "--error-unmatch", path], { cwd: projectRoot });
+  }
+  await execute("git", [
+    "archive",
+    "--format=tar",
+    `--output=${archive}`,
+    "HEAD",
+    "dist/index.js",
+    "dist/web-tree-sitter.wasm",
+    "dist/tree-sitter-go.wasm",
+    "schemas/adversary.review.v1.schema.json",
+    "THIRD_PARTY_NOTICES.md",
+    "package.json",
+  ], { cwd: projectRoot });
+  await execute("tar", ["-xf", archive, "-C", artifact]);
   await writeFile(join(repository, "main.go"), "package sample\n\nfunc ready() bool { return true }\n");
+  await writeFile(join(repository, "go.mod"), "module example.com/project\n\ngo 1.24\n");
   await writeFile(input, `${JSON.stringify({ source: { path: repository } })}\n`);
 
   const bundle = await readFile(entrypoint, "utf8");
