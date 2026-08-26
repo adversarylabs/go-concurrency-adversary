@@ -383,7 +383,7 @@ function methodStopsField(method: Node, source: string, fieldName: string): bool
 function helperStopsListener(body: Node, source: string, listenerName: string, callbackCall: Node): boolean {
   return descendants(body, "call_expression").some((call) => {
     if (!callIsDefinitelyActive(call, body) || !nodeIsReachable(call, body, source)) return false;
-    if (!unconditionallyExecutedWithinCallable(call, body)) return false;
+    if (!unconditionallyExecutedWithinCallable(call, body, source)) return false;
     const fn = call.childForFieldName("function");
     if (fn?.type !== "selector_expression") return false;
     const operand = fn.childForFieldName("operand");
@@ -437,22 +437,58 @@ function callIsDefinitelyActive(call: Node, callableBody: Node): boolean {
   return current?.id === callableBody.id;
 }
 
-function unconditionallyExecutedWithinCallable(node: Node, callableBody: Node): boolean {
+function unconditionallyExecutedWithinCallable(node: Node, callableBody: Node, source: string): boolean {
   let current: Node | null = node;
   while (current !== null && current.id !== callableBody.id) {
     const parent: Node | null = current.parent;
     if (parent === null) return false;
+    const statements = directStatements(parent);
+    const containingIndex = statements.findIndex((statement) => containsNode(statement, current!));
+    if (containingIndex >= 0 && statements.slice(0, containingIndex)
+      .some((statement) => statementCanBypass(statement, callableBody, source))) return false;
     if (parent.type === "func_literal") {
       const execution = directLiteralExecution(parent);
       if (execution === undefined) return false;
       current = execution;
       continue;
     }
-    if (["if_statement", "for_statement", "expression_switch_statement", "type_switch_statement",
+    if (parent.type === "if_statement") {
+      const condition = parent.childForFieldName("condition");
+      const consequence = parent.childForFieldName("consequence");
+      const alternative = parent.childForFieldName("alternative");
+      const value = condition === null ? undefined : staticBoolean(condition, source);
+      const inConsequence = consequence !== null && containsNode(consequence, current);
+      const inAlternative = alternative !== null && containsNode(alternative, current);
+      if ((value !== true || !inConsequence) && (value !== false || !inAlternative)) return false;
+    } else if (["for_statement", "expression_switch_statement", "type_switch_statement",
       "select_statement"].includes(parent.type)) return false;
     current = parent;
   }
   return current?.id === callableBody.id;
+}
+
+/**
+ * A close after a conditional return is not a definite shutdown path. Ignore
+ * exits in stored nested closures: only the currently executing callable can
+ * bypass the candidate call.
+ */
+function statementCanBypass(statement: Node, callableBody: Node, source: string): boolean {
+  const candidates = [statement, ...directCallableDescendants(statement, "return_statement"),
+    ...directCallableDescendants(statement, "break_statement"),
+    ...directCallableDescendants(statement, "continue_statement"),
+    ...directCallableDescendants(statement, "goto_statement")];
+  if (candidates.some((candidate) =>
+    ["return_statement", "break_statement", "continue_statement", "goto_statement"].includes(candidate.type) &&
+    nodeIsReachable(candidate, callableBody, source))) return true;
+  return directCallableDescendants(statement, "call_expression").some((call) => {
+    if (!nodeIsReachable(call, callableBody, source)) return false;
+    const fn = call.childForFieldName("function");
+    return fn?.type === "identifier" && sourceText(fn, source) === "panic" &&
+      !callableParameterNamed(callableBody, "panic", source) &&
+      !localBindingShadowsAtUse(callableBody, "panic", call, source) &&
+      !nestedCallableParameterShadowsAtUse(callableBody, "panic", call, source) &&
+      !packageBindingNamed(callableBody, "panic", source);
+  });
 }
 
 function directLiteralExecution(literal: Node): Node | undefined {
@@ -557,7 +593,8 @@ function bindingChangesBetween(
   return changes.some((change) => {
     if (change.startIndex <= startIndex || change.endIndex >= use.startIndex ||
         !bindingNames(change, source).includes(name) ||
-        !sameCallableScope(change, use, body) ||
+        (!sameCallableScope(change, use, body) &&
+          !directIIFEChangeCanAffectUse(change, use, body, source)) ||
         !nodeIsReachable(change, body, source)) return false;
     if (change.type === "short_var_declaration" ||
         (change.type === "range_clause" && sourceText(change, source).includes(":" + "="))) {
@@ -566,6 +603,24 @@ function bindingChangesBetween(
     return !localBindingDeclaredAfter(body, name, startIndex, change, source) &&
       !nestedCallableParameterShadowsAtUse(body, name, change, source);
   });
+}
+
+/**
+ * An assignment in a synchronously invoked literal mutates captured outer
+ * bindings before the later use. Stored and asynchronous closures do not
+ * provide the same ordered provenance proof.
+ */
+function directIIFEChangeCanAffectUse(
+  change: Node,
+  use: Node,
+  body: Node,
+  source: string,
+): boolean {
+  const literal = nearestAncestor(change, "func_literal");
+  if (literal === null) return false;
+  const execution = directLiteralExecution(literal);
+  return execution?.type === "expression_statement" && execution.endIndex < use.startIndex &&
+    sameCallableScope(execution, use, body) && nodeIsReachable(execution, body, source);
 }
 
 function localBindingDeclaredAfter(

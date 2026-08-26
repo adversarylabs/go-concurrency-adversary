@@ -329,6 +329,45 @@ test("keeps unreachable binding changes separate and requires a definite IIFE st
   }
 });
 
+test("tracks captured IIFE mutations and all-path cleanup execution", async () => {
+  const receiverMutation = vulnerableProject();
+  receiverMutation["plugins/server/debug/plugin.go"] = receiverMutation["plugins/server/debug/plugin.go"]!
+    .replace("type server struct", "var other server\n\ntype server struct")
+    .replace("  listener, err := net.Listen", "  func() { s = other }()\n  listener, err := net.Listen");
+  const listenerMutation = vulnerableProject();
+  listenerMutation["plugins/server/debug/plugin.go"] = listenerMutation["plugins/server/debug/plugin.go"]!
+    .replace("internal.Serve(ctx, listener, s.handler.Serve)",
+      "func() { listener = nil }()\n  internal.Serve(ctx, listener, s.handler.Serve)");
+  for (const files of [receiverMutation, listenerMutation]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const conditionalIIFE = vulnerableProject();
+  conditionalIIFE["plugins/server/internal/serve.go"] = conditionalIIFE["plugins/server/internal/serve.go"]!
+    .replace("  go func() {",
+      "  func() { if skip() { return }; _ = listener.Close() }()\n  go func() {");
+  const conditionalGoroutine = vulnerableProject();
+  conditionalGoroutine["plugins/server/internal/serve.go"] = conditionalGoroutine["plugins/server/internal/serve.go"]!
+    .replace("  go func() {",
+      "  go func() { if skip() { return }; _ = listener.Close() }()\n  go func() {");
+  const staticallyFalse = vulnerableProject();
+  staticallyFalse["plugins/server/internal/serve.go"] = staticallyFalse["plugins/server/internal/serve.go"]!
+    .replace("  go func() {",
+      "  if false { func() { _ = listener.Close() }() }\n  go func() {");
+  for (const files of [conditionalIIFE, conditionalGoroutine, staticallyFalse]) {
+    const output = await review(await repository(files));
+    assert.equal(output.findings.some((item) => item.ruleId === ruleId), true);
+  }
+
+  const staticallyTrue = vulnerableProject();
+  staticallyTrue["plugins/server/internal/serve.go"] = staticallyTrue["plugins/server/internal/serve.go"]!
+    .replace("  go func() {",
+      "  if true { func() { _ = listener.Close() }() }\n  go func() {");
+  const safe = await review(await repository(staticallyTrue));
+  assert.equal(safe.findings.some((item) => item.ruleId === ruleId), false);
+});
+
 test("anchors helper callback and weakened-stop activation guards", async () => {
   const callbackGuard = vulnerableProject();
   callbackGuard["plugins/server/internal/serve.go"] = callbackGuard["plugins/server/internal/serve.go"]!
