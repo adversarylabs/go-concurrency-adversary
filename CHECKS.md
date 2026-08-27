@@ -15,6 +15,7 @@
 | `go-concurrency.goroutine-id-state-key` | Medium | Production mutable state is keyed by a goroutine identifier parsed from `runtime.Stack` text |
 | `go-concurrency.loopvar.capture` | Medium | Loop variable captured by goroutine |
 | `go-concurrency.mutex.copy` | High | Mutex / RWMutex copied by value |
+| `go-concurrency.rwmutex.read-lock-write` | High | A changed receiver-owned map assignment or delete occurs while the same receiver holds a proven `sync.RWMutex` read lock; full write locks, local maps, unrelated locks, dead paths, tests, and unchanged legacy relationships stay quiet |
 | `go-concurrency.select.default-busy` | Medium | Busy select with default in a tight loop |
 | `go-concurrency.ticker.not-stopped` | Medium | Ticker not stopped |
 | `go-concurrency.timer.not-stopped` | Medium | Timer not stopped/drained |

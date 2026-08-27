@@ -13,6 +13,7 @@ export async function reviewConcurrency(
   const waitGroupCompletion = matching(analysis, "go-concurrency.waitgroup.done-not-deferred");
   const waitGroupCopied = matching(analysis, "go-concurrency.waitgroup.copied");
   const mutexCopy = matching(analysis, "go-concurrency.mutex.copy");
+  const readLockWrites = matching(analysis, "go-concurrency.rwmutex.read-lock-write");
   const loopVars = matching(analysis, "go-concurrency.loopvar.capture");
   const cancellation = matching(analysis, "go-concurrency.context.cancellation");
   const detachedContexts = matching(analysis, "go-concurrency.context.background-in-request");
@@ -71,6 +72,15 @@ export async function reviewConcurrency(
     whyItMatters: "sync.Mutex and sync.RWMutex are not safe to copy; copies have independent state and break mutual exclusion.",
     impact: "Concurrent critical sections can run without synchronization, causing data races and corrupted shared state.",
     recommendation: "Pass or store *sync.Mutex/*sync.RWMutex (or embed the mutex in a struct used only via pointer) and never assign mutex values.",
+  });
+  emitGroupedFinding(ctx, readLockWrites, {
+    title: "Shared map is written while only an RWMutex read lock is held",
+    category: "correctness",
+    severity: "high",
+    summary: (count) => `${count} receiver-owned map mutation${count === 1 ? " occurs" : "s occur"} inside an RLock/RUnlock critical section.`,
+    whyItMatters: "RWMutex permits multiple read-lock holders at once. A map assignment or delete under RLock can therefore race with another reader performing the same write, and concurrent Go map writes can panic or corrupt state.",
+    impact: "Concurrent callers can trigger data races, runtime concurrent-map-write failures, or inconsistent shared state even though the method appears to be locked.",
+    recommendation: "Use Lock/Unlock for a critical section that mutates the map, or move the mutation into a separately proven exclusive phase.",
   });
   emitGroupedFinding(ctx, loopVars, {
     title: "Goroutine captures a loop variable without binding",
@@ -209,6 +219,7 @@ export async function reviewConcurrency(
   if (waitGroupCompletion.length > 0) staticSeverities.push("high");
   if (waitGroupCopied.length > 0) staticSeverities.push("high");
   if (mutexCopy.length > 0) staticSeverities.push("critical");
+  if (readLockWrites.length > 0) staticSeverities.push("high");
   if (loopVars.length > 0) staticSeverities.push("high");
   if (cancellation.length > 0) staticSeverities.push("medium");
   if (detachedContexts.length > 0) staticSeverities.push("medium");
@@ -225,6 +236,7 @@ export async function reviewConcurrency(
   const staticPrimaryConcern =
     deadlocks.length > 0 ? "local channel self-deadlocks" :
     mutexCopy.length > 0 ? "copied mutex values" :
+    readLockWrites.length > 0 ? "writes protected only by an RWMutex read lock" :
     waitGroups.length > 0 ? "WaitGroup registration races" :
     waitGroupCompletion.length > 0 ? "skippable WaitGroup completion" :
     waitGroupCopied.length > 0 ? "WaitGroup value copies" :
@@ -260,6 +272,7 @@ export async function reviewConcurrency(
     waitGroupCompletion,
     waitGroupCopied,
     mutexCopy,
+    readLockWrites,
     loopVars,
     cancellation,
     detachedContexts,
@@ -362,6 +375,7 @@ function addAssessment(
     waitGroupCompletion: Signal[];
     waitGroupCopied: Signal[];
     mutexCopy: Signal[];
+    readLockWrites: Signal[];
     loopVars: Signal[];
     cancellation: Signal[];
     detachedContexts: Signal[];
@@ -397,6 +411,17 @@ function addAssessment(
     ctx.review.opinion({
       ship: false,
       summary: "I would eliminate mutex value copies before merging.",
+    });
+    return;
+  }
+  if (groups.readLockWrites.length > 0) {
+    ctx.review.assessment({
+      risk: "high",
+      summary: "Shared map mutation is not serialized because the affected method holds only an RWMutex read lock while writing receiver state.",
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would use the RWMutex write lock for the mutating critical section before merging.",
     });
     return;
   }
