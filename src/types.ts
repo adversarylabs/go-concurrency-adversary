@@ -34,6 +34,7 @@ export interface Signal {
     | "go-concurrency.timer.not-stopped"
     | "go-concurrency.channel.self-deadlock"
     | "go-concurrency.waitgroup.done-not-deferred"
+    | "go-concurrency.rwmutex.read-lock-write"
     | "go-concurrency.atomic-capacity-check-update"
     | "go-concurrency.goroutine-id-state-key"
     | "go-concurrency.external-state-marker-before-success"

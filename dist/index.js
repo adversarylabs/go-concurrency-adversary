@@ -21973,6 +21973,7 @@ async function analyzeFile(file) {
     analyzeContextDetachment(file, tree.rootNode, aliases, signals);
     analyzeGoroutineIDStateKeys(file, tree.rootNode, previousTree?.rootNode, aliases, signals);
     analyzePrematureExternalStateMarker(file, tree.rootNode, previousTree?.rootNode, signals);
+    analyzeReadLockWrites(file, tree.rootNode, previousTree?.rootNode, aliases, signals);
     analyzeStoredContextFields(file, tree.rootNode, aliases, signals);
     analyzeAsyncListenerMissingClose(file, tree.rootNode, signals);
     for (const fn of [
@@ -21992,6 +21993,228 @@ async function analyzeFile(file) {
     previousTree?.delete();
     tree.delete();
   }
+}
+function analyzeReadLockWrites(file, root, previousRoot, aliases, signals) {
+  if (file.path.endsWith("_test.go")) return;
+  const syncAlias = aliases.get("sync");
+  if (syncAlias === void 0) return;
+  const current = collectReadLockWrites(root, file.current, syncAlias);
+  if (current.length === 0) return;
+  const previousAliases = previousRoot === void 0 || file.previous === void 0 ? /* @__PURE__ */ new Map() : importAliases(previousRoot, file.previous);
+  const previousSyncAlias = previousAliases.get("sync");
+  const previous = previousRoot === void 0 || file.previous === void 0 || previousSyncAlias === void 0 ? /* @__PURE__ */ new Set() : new Set(collectReadLockWrites(previousRoot, file.previous, previousSyncAlias).map((fact) => fact.signature));
+  for (const fact of current) {
+    if (file.status === "modified" && previous.has(fact.signature)) continue;
+    const evidence = [fact.write, fact.lockCall, fact.unlockCall, fact.typeEvidence];
+    const anchor = evidence.find((node) => isSemanticallyChangedEvidence(file, node, previousRoot));
+    if (file.status === "modified" && anchor === void 0) continue;
+    signals.push(signal(
+      file,
+      anchor ?? fact.write,
+      "go-concurrency.rwmutex.read-lock-write",
+      `${fact.method} writes ${fact.state} while ${fact.lock}.RLock is held; a read lock does not serialize writers.`,
+      {
+        form: "receiver-map-write-under-read-lock",
+        method: fact.method,
+        lock: fact.lock,
+        state: fact.state,
+        writeLine: fact.write.startPosition.row + 1,
+        lockLine: fact.lockCall.startPosition.row + 1,
+        unlockLine: fact.unlockCall.startPosition.row + 1
+      }
+    ));
+  }
+}
+function collectReadLockWrites(root, source, syncAlias) {
+  const facts = [];
+  const stateIndex = mutableStateIndex(root, source, syncAlias);
+  const lockFields = rwMutexFields(root, source, syncAlias);
+  for (const method of descendants(root, "method_declaration")) {
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverBinding(method, source);
+    const methodName2 = functionNameOf(method, source);
+    if (body2 === null || receiver === void 0 || methodName2 === void 0) continue;
+    const availableLocks = lockFields.get(receiver.type);
+    if (availableLocks === void 0 || availableLocks.size === 0) continue;
+    const topLevel = body2.namedChildren.find((node) => node.type === "statement_list");
+    if (topLevel === void 0) continue;
+    const calls = functionDescendants(method, body2, "call_expression");
+    for (const lockCall of calls) {
+      const selected = selectedCall(lockCall, source);
+      if (selected?.field !== "RLock") continue;
+      const lockField = receiverLockField(selected.operand, receiver.name, availableLocks);
+      const lockStatement = directTopLevelStatement(lockCall, topLevel);
+      if (lockField === void 0 || lockStatement?.type !== "expression_statement" || !nodeReachableInCallable(lockCall, method, body2, source)) continue;
+      const unlockCall = calls.find((candidate) => {
+        if (candidate.startIndex <= lockCall.endIndex) return false;
+        const unlock = selectedCall(candidate, source);
+        const statement = directTopLevelStatement(candidate, topLevel);
+        return unlock?.field === "RUnlock" && unlock.operand === selected.operand && (statement?.type === "expression_statement" || statement?.type === "defer_statement") && nodeReachableInCallable(candidate, method, body2, source);
+      });
+      if (unlockCall === void 0) continue;
+      for (const write of receiverMapWrites(method, body2, source, stateIndex, receiver.name)) {
+        if (write.startIndex <= lockCall.endIndex) continue;
+        if (!isDeferredUnlockCall(unlockCall) && write.startIndex >= unlockCall.startIndex) continue;
+        if (!nodeReachableInCallable(write, method, body2, source)) continue;
+        const state = writtenMapExpression(write, source, stateIndex, receiver.name);
+        if (state === void 0) continue;
+        const typeEvidence = availableLocks.get(lockField);
+        if (typeEvidence === void 0) continue;
+        facts.push({
+          signature: [
+            `${receiver.type}.${methodName2}`,
+            selected.operand,
+            semanticNodeSignature(write, source)
+          ].join("|"),
+          method: `${receiver.type}.${methodName2}`,
+          lock: selected.operand,
+          state,
+          write,
+          lockCall,
+          unlockCall,
+          typeEvidence
+        });
+      }
+    }
+  }
+  return facts;
+}
+function rwMutexFields(root, source, syncAlias) {
+  const result = /* @__PURE__ */ new Map();
+  for (const spec of descendants(root, "type_spec")) {
+    const name2 = spec.childForFieldName("name");
+    const type = spec.childForFieldName("type");
+    if (name2 === null || type?.type !== "struct_type") continue;
+    const fields = /* @__PURE__ */ new Map();
+    for (const field of descendants(type, "field_declaration")) {
+      if (nearestAncestor2(field, "struct_type")?.id !== type.id) continue;
+      const fieldType = field.childForFieldName("type");
+      if (fieldType === null || normalizeGoType(sourceText(fieldType, source)) !== `${syncAlias}.RWMutex`) continue;
+      const names = directDeclaredNames(field, source);
+      if (names.length === 0) fields.set("", field);
+      else for (const fieldName of names) fields.set(fieldName, field);
+    }
+    if (fields.size > 0) result.set(sourceText(name2, source), fields);
+  }
+  for (const method of descendants(root, "method_declaration")) {
+    const receiverType2 = methodReceiverTypeName(method, source);
+    const name2 = functionNameOf(method, source);
+    if (receiverType2 !== void 0 && (name2 === "RLock" || name2 === "RUnlock")) {
+      result.get(receiverType2)?.delete("");
+    }
+  }
+  return result;
+}
+function methodReceiverBinding(method, source) {
+  const receiver = method.childForFieldName("receiver");
+  const declaration = receiver === null ? void 0 : descendants(receiver, "parameter_declaration")[0];
+  const type = declaration?.childForFieldName("type");
+  const name2 = declaration === void 0 ? void 0 : directDeclaredNames(declaration, source)[0];
+  if (type === void 0 || type === null || name2 === void 0) return void 0;
+  const normalized = normalizeGoType(sourceText(type, source));
+  return /^[A-Za-z_]\w*$/.test(normalized) ? { name: name2, type: normalized } : void 0;
+}
+function receiverLockField(operand, receiver, fields) {
+  if (operand === receiver && fields.has("")) return "";
+  const prefix = `${receiver}.`;
+  if (!operand.startsWith(prefix)) return void 0;
+  const field = operand.slice(prefix.length);
+  return !field.includes(".") && fields.size === 1 && fields.has(field) ? field : void 0;
+}
+function directTopLevelStatement(node, statementList) {
+  let current = node;
+  while (current !== null && current.parent?.id !== statementList.id) current = current.parent;
+  return current?.parent?.id === statementList.id ? current : void 0;
+}
+function isDeferredUnlockCall(call) {
+  let current = call.parent;
+  while (current !== null) {
+    if (current.type === "defer_statement") return true;
+    if (current.type === "statement_list" || current.type === "function_declaration" || current.type === "method_declaration" || current.type === "func_literal") return false;
+    current = current.parent;
+  }
+  return false;
+}
+function receiverMapWrites(method, body2, source, index, receiver) {
+  const writes = [];
+  for (const assignment of functionDescendants(method, body2, "assignment_statement")) {
+    const left = assignment.childForFieldName("left")?.namedChildren ?? [];
+    if (left.some((candidate) => receiverMapExpression(candidate, source, index, receiver) !== void 0)) {
+      writes.push(assignment);
+    }
+  }
+  for (const update of functionDescendants(method, body2, "inc_statement")) {
+    if (update.namedChildren.some((candidate) => receiverMapExpression(candidate, source, index, receiver) !== void 0)) writes.push(update);
+  }
+  for (const call of functionDescendants(method, body2, "call_expression")) {
+    const fn = call.childForFieldName("function");
+    const args2 = call.childForFieldName("arguments")?.namedChildren ?? [];
+    if (fn?.type === "identifier" && sourceText(fn, source) === "delete" && args2[0] !== void 0 && isBuiltinDelete(call, method, source) && receiverMapExpression(args2[0], source, index, receiver) !== void 0) writes.push(call);
+  }
+  return writes;
+}
+function writtenMapExpression(write, source, index, receiver) {
+  if (write.type === "call_expression") {
+    const arg = write.childForFieldName("arguments")?.namedChildren[0];
+    return arg === void 0 ? void 0 : receiverMapExpression(arg, source, index, receiver);
+  }
+  const left = write.childForFieldName("left")?.namedChildren ?? write.namedChildren;
+  return left.map((candidate) => receiverMapExpression(candidate, source, index, receiver)).find((candidate) => candidate !== void 0);
+}
+function receiverMapExpression(node, source, index, receiver) {
+  const map = node.type === "index_expression" ? node.childForFieldName("operand") : node;
+  if (map === null || !isMutableStateExpression(map, index)) return void 0;
+  const text = sourceText(map, source);
+  return text.startsWith(`${receiver}.`) ? text : void 0;
+}
+function staticallyDeadNode(node, callableBody, source) {
+  let current = node;
+  while (current !== null && current.id !== callableBody.id) {
+    const parent = current.parent;
+    if (parent?.type === "if_statement") {
+      const condition = parent.childForFieldName("condition");
+      const consequence = parent.childForFieldName("consequence");
+      const alternative = parent.childForFieldName("alternative");
+      const value = condition === null ? void 0 : semanticText(sourceText(condition, source));
+      if (value === "false" && consequence !== null && nodeInside(node, consequence) || value === "true" && alternative !== null && nodeInside(node, alternative)) return true;
+    }
+    current = parent;
+  }
+  return false;
+}
+function nodeReachableInCallable(node, callable, callableBody, source) {
+  if (staticallyDeadNode(node, callableBody, source)) return false;
+  let current = node;
+  while (current !== null && current.id !== callableBody.id) {
+    let direct = current;
+    while (direct.parent !== null && direct.parent.type !== "statement_list" && direct.parent.id !== callableBody.id) direct = direct.parent;
+    const list = direct.parent?.type === "statement_list" ? direct.parent : void 0;
+    if (list === void 0) {
+      current = direct.parent;
+      continue;
+    }
+    let outcomes = pathContinues;
+    for (const statement of list.namedChildren) {
+      if (statement.id === direct.id) break;
+      if ((outcomes & pathContinues) === 0) return false;
+      outcomes = outcomes & ~pathContinues | statementTerminationOutcomes(statement, callable, source, true);
+    }
+    if ((outcomes & pathContinues) === 0) return false;
+    current = list.parent;
+  }
+  return true;
+}
+function isBuiltinDelete(call, callable, source) {
+  if (isLocallyShadowedAt(callable, call, source, "delete")) return false;
+  let root = callable;
+  while (root.parent !== null) root = root.parent;
+  return !descendants(root, "function_declaration").some((fn) => {
+    const name2 = fn.childForFieldName("name");
+    return name2 !== null && sourceText(name2, source) === "delete";
+  }) && !descendants(root, "var_spec").some((spec) => findEnclosingCallable(spec) === null && directDeclaredNames(spec, source).includes("delete"));
+}
+function nodeInside(node, ancestor) {
+  return node.startIndex >= ancestor.startIndex && node.endIndex <= ancestor.endIndex;
 }
 function analyzePrematureExternalStateMarker(file, root, previousRoot, signals) {
   if (file.path.endsWith("_test.go")) return;
@@ -24832,6 +25055,7 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
   const waitGroupCompletion = matching(analysis, "go-concurrency.waitgroup.done-not-deferred");
   const waitGroupCopied = matching(analysis, "go-concurrency.waitgroup.copied");
   const mutexCopy = matching(analysis, "go-concurrency.mutex.copy");
+  const readLockWrites = matching(analysis, "go-concurrency.rwmutex.read-lock-write");
   const loopVars = matching(analysis, "go-concurrency.loopvar.capture");
   const cancellation = matching(analysis, "go-concurrency.context.cancellation");
   const detachedContexts = matching(analysis, "go-concurrency.context.background-in-request");
@@ -24889,6 +25113,15 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
     whyItMatters: "sync.Mutex and sync.RWMutex are not safe to copy; copies have independent state and break mutual exclusion.",
     impact: "Concurrent critical sections can run without synchronization, causing data races and corrupted shared state.",
     recommendation: "Pass or store *sync.Mutex/*sync.RWMutex (or embed the mutex in a struct used only via pointer) and never assign mutex values."
+  });
+  emitGroupedFinding(ctx, readLockWrites, {
+    title: "Shared map is written while only an RWMutex read lock is held",
+    category: "correctness",
+    severity: "high",
+    summary: (count) => `${count} receiver-owned map mutation${count === 1 ? " occurs" : "s occur"} inside an RLock/RUnlock critical section.`,
+    whyItMatters: "RWMutex permits multiple read-lock holders at once. A map assignment or delete under RLock can therefore race with another reader performing the same write, and concurrent Go map writes can panic or corrupt state.",
+    impact: "Concurrent callers can trigger data races, runtime concurrent-map-write failures, or inconsistent shared state even though the method appears to be locked.",
+    recommendation: "Use Lock/Unlock for a critical section that mutates the map, or move the mutation into a separately proven exclusive phase."
   });
   emitGroupedFinding(ctx, loopVars, {
     title: "Goroutine captures a loop variable without binding",
@@ -25014,6 +25247,7 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
   if (waitGroupCompletion.length > 0) staticSeverities.push("high");
   if (waitGroupCopied.length > 0) staticSeverities.push("high");
   if (mutexCopy.length > 0) staticSeverities.push("critical");
+  if (readLockWrites.length > 0) staticSeverities.push("high");
   if (loopVars.length > 0) staticSeverities.push("high");
   if (cancellation.length > 0) staticSeverities.push("medium");
   if (detachedContexts.length > 0) staticSeverities.push("medium");
@@ -25027,7 +25261,7 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
   if (goroutineIDStateKeys.length > 0) staticSeverities.push("medium");
   if (concurrentApiMissing.length > 0) staticSeverities.push("medium");
   if (asyncListenerMissingClose.length > 0) staticSeverities.push("high");
-  const staticPrimaryConcern = deadlocks.length > 0 ? "local channel self-deadlocks" : mutexCopy.length > 0 ? "copied mutex values" : waitGroups.length > 0 ? "WaitGroup registration races" : waitGroupCompletion.length > 0 ? "skippable WaitGroup completion" : waitGroupCopied.length > 0 ? "WaitGroup value copies" : loopVars.length > 0 ? "loop variable captures in goroutines" : atomicCapacity.length > 0 ? "non-atomic capacity admission" : prematureStateMarkers.length > 0 ? "failed external work recorded as completed local state" : goroutineIDStateKeys.length > 0 ? "goroutine identifiers used as mutable state keys" : cancellation.length > 0 ? "discarded cancellation ownership" : detachedContexts.length > 0 ? "operations detached from caller cancellation" : storedContexts.length > 0 ? "context.Context stored on structs" : cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" : selectBusy.length > 0 ? "busy-spinning select defaults" : tickers.length > 0 ? "tickers without Stop" : timers.length > 0 ? "time.After inside loops" : concurrentApiMissing.length > 0 ? "missing tests for concurrent API serialization" : asyncListenerMissingClose.length > 0 ? "async listeners without Close or Shutdown" : void 0;
+  const staticPrimaryConcern = deadlocks.length > 0 ? "local channel self-deadlocks" : mutexCopy.length > 0 ? "copied mutex values" : readLockWrites.length > 0 ? "writes protected only by an RWMutex read lock" : waitGroups.length > 0 ? "WaitGroup registration races" : waitGroupCompletion.length > 0 ? "skippable WaitGroup completion" : waitGroupCopied.length > 0 ? "WaitGroup value copies" : loopVars.length > 0 ? "loop variable captures in goroutines" : atomicCapacity.length > 0 ? "non-atomic capacity admission" : prematureStateMarkers.length > 0 ? "failed external work recorded as completed local state" : goroutineIDStateKeys.length > 0 ? "goroutine identifiers used as mutable state keys" : cancellation.length > 0 ? "discarded cancellation ownership" : detachedContexts.length > 0 ? "operations detached from caller cancellation" : storedContexts.length > 0 ? "context.Context stored on structs" : cancellationErrors.length > 0 ? "context cancellation handled as an ordinary failure" : selectBusy.length > 0 ? "busy-spinning select defaults" : tickers.length > 0 ? "tickers without Stop" : timers.length > 0 ? "time.After inside loops" : concurrentApiMissing.length > 0 ? "missing tests for concurrent API serialization" : asyncListenerMissingClose.length > 0 ? "async listeners without Close or Shutdown" : void 0;
   await attachImportNavigation(ctx, analysis);
   const modelStatus = await runModelConcurrencyReview(
     ctx,
@@ -25045,6 +25279,7 @@ async function reviewConcurrency(ctx, analysis, discoveryFiles = []) {
     waitGroupCompletion,
     waitGroupCopied,
     mutexCopy,
+    readLockWrites,
     loopVars,
     cancellation,
     detachedContexts,
@@ -25135,6 +25370,17 @@ function addAssessment(ctx, groups) {
     ctx.review.opinion({
       ship: false,
       summary: "I would eliminate mutex value copies before merging."
+    });
+    return;
+  }
+  if (groups.readLockWrites.length > 0) {
+    ctx.review.assessment({
+      risk: "high",
+      summary: "Shared map mutation is not serialized because the affected method holds only an RWMutex read lock while writing receiver state."
+    });
+    ctx.review.opinion({
+      ship: false,
+      summary: "I would use the RWMutex write lock for the mutating critical section before merging."
     });
     return;
   }
@@ -25329,7 +25575,7 @@ function addAssessment(ctx, groups) {
 function createApp() {
   const app = new Adversary({
     name: "go-concurrency",
-    version: "0.0.25",
+    version: "0.0.26",
     review: { maximumFindings: 5, minimumConfidence: "medium" }
   });
   app.rule("go-concurrency.review", async (ctx) => {

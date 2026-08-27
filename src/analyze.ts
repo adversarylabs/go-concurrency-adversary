@@ -41,6 +41,7 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
     analyzeContextDetachment(file, tree.rootNode, aliases, signals);
     analyzeGoroutineIDStateKeys(file, tree.rootNode, previousTree?.rootNode, aliases, signals);
     analyzePrematureExternalStateMarker(file, tree.rootNode, previousTree?.rootNode, signals);
+    analyzeReadLockWrites(file, tree.rootNode, previousTree?.rootNode, aliases, signals);
     analyzeStoredContextFields(file, tree.rootNode, aliases, signals);
     analyzeAsyncListenerMissingClose(file, tree.rootNode, signals);
     for (const fn of [
@@ -61,6 +62,309 @@ async function analyzeFile(file: SourceRevision): Promise<{ signals: Signal[]; p
     previousTree?.delete();
     tree.delete();
   }
+}
+
+interface ReadLockWrite {
+  signature: string;
+  method: string;
+  lock: string;
+  state: string;
+  write: Node;
+  lockCall: Node;
+  unlockCall: Node;
+  typeEvidence: Node;
+}
+
+/**
+ * Detect receiver-owned map writes performed while the same receiver holds an
+ * RWMutex read lock. The proof is deliberately local: a method-level RLock
+ * must dominate the write, a matching RUnlock must close the critical section,
+ * and the written map must be a declared field on the exact method receiver.
+ */
+function analyzeReadLockWrites(
+  file: SourceRevision,
+  root: Node,
+  previousRoot: Node | undefined,
+  aliases: Map<string, string>,
+  signals: Signal[],
+): void {
+  if (file.path.endsWith("_test.go")) return;
+  const syncAlias = aliases.get("sync");
+  if (syncAlias === undefined) return;
+  const current = collectReadLockWrites(root, file.current, syncAlias);
+  if (current.length === 0) return;
+  const previousAliases = previousRoot === undefined || file.previous === undefined
+    ? new Map<string, string>()
+    : importAliases(previousRoot, file.previous);
+  const previousSyncAlias = previousAliases.get("sync");
+  const previous = previousRoot === undefined || file.previous === undefined || previousSyncAlias === undefined
+    ? new Set<string>()
+    : new Set(collectReadLockWrites(previousRoot, file.previous, previousSyncAlias)
+      .map((fact) => fact.signature));
+
+  for (const fact of current) {
+    if (file.status === "modified" && previous.has(fact.signature)) continue;
+    const evidence = [fact.write, fact.lockCall, fact.unlockCall, fact.typeEvidence];
+    const anchor = evidence.find((node) =>
+      isSemanticallyChangedEvidence(file, node, previousRoot));
+    if (file.status === "modified" && anchor === undefined) continue;
+    signals.push(signal(
+      file,
+      anchor ?? fact.write,
+      "go-concurrency.rwmutex.read-lock-write",
+      `${fact.method} writes ${fact.state} while ${fact.lock}.RLock is held; a read lock does not serialize writers.`,
+      {
+        form: "receiver-map-write-under-read-lock",
+        method: fact.method,
+        lock: fact.lock,
+        state: fact.state,
+        writeLine: fact.write.startPosition.row + 1,
+        lockLine: fact.lockCall.startPosition.row + 1,
+        unlockLine: fact.unlockCall.startPosition.row + 1,
+      },
+    ));
+  }
+}
+
+function collectReadLockWrites(root: Node, source: string, syncAlias: string): ReadLockWrite[] {
+  const facts: ReadLockWrite[] = [];
+  const stateIndex = mutableStateIndex(root, source, syncAlias);
+  const lockFields = rwMutexFields(root, source, syncAlias);
+  for (const method of descendants(root, "method_declaration")) {
+    const body = method.childForFieldName("body");
+    const receiver = methodReceiverBinding(method, source);
+    const methodName = functionNameOf(method, source);
+    if (body === null || receiver === undefined || methodName === undefined) continue;
+    const availableLocks = lockFields.get(receiver.type);
+    if (availableLocks === undefined || availableLocks.size === 0) continue;
+    const topLevel = body.namedChildren.find((node) => node.type === "statement_list");
+    if (topLevel === undefined) continue;
+    const calls = functionDescendants(method, body, "call_expression");
+    for (const lockCall of calls) {
+      const selected = selectedCall(lockCall, source);
+      if (selected?.field !== "RLock") continue;
+      const lockField = receiverLockField(selected.operand, receiver.name, availableLocks);
+      const lockStatement = directTopLevelStatement(lockCall, topLevel);
+      if (lockField === undefined || lockStatement?.type !== "expression_statement" ||
+          !nodeReachableInCallable(lockCall, method, body, source)) continue;
+      const unlockCall = calls.find((candidate) => {
+        if (candidate.startIndex <= lockCall.endIndex) return false;
+        const unlock = selectedCall(candidate, source);
+        const statement = directTopLevelStatement(candidate, topLevel);
+        return unlock?.field === "RUnlock" && unlock.operand === selected.operand &&
+          (statement?.type === "expression_statement" || statement?.type === "defer_statement") &&
+          nodeReachableInCallable(candidate, method, body, source);
+      });
+      if (unlockCall === undefined) continue;
+      for (const write of receiverMapWrites(method, body, source, stateIndex, receiver.name)) {
+        if (write.startIndex <= lockCall.endIndex) continue;
+        if (!isDeferredUnlockCall(unlockCall) && write.startIndex >= unlockCall.startIndex) continue;
+        if (!nodeReachableInCallable(write, method, body, source)) continue;
+        const state = writtenMapExpression(write, source, stateIndex, receiver.name);
+        if (state === undefined) continue;
+        const typeEvidence = availableLocks.get(lockField);
+        if (typeEvidence === undefined) continue;
+        facts.push({
+          signature: [
+            `${receiver.type}.${methodName}`,
+            selected.operand,
+            semanticNodeSignature(write, source),
+          ].join("|"),
+          method: `${receiver.type}.${methodName}`,
+          lock: selected.operand,
+          state,
+          write,
+          lockCall,
+          unlockCall,
+          typeEvidence,
+        });
+      }
+    }
+  }
+  return facts;
+}
+
+function rwMutexFields(root: Node, source: string, syncAlias: string): Map<string, Map<string, Node>> {
+  const result = new Map<string, Map<string, Node>>();
+  for (const spec of descendants(root, "type_spec")) {
+    const name = spec.childForFieldName("name");
+    const type = spec.childForFieldName("type");
+    if (name === null || type?.type !== "struct_type") continue;
+    const fields = new Map<string, Node>();
+    for (const field of descendants(type, "field_declaration")) {
+      if (nearestAncestor(field, "struct_type")?.id !== type.id) continue;
+      const fieldType = field.childForFieldName("type");
+      if (fieldType === null || normalizeGoType(sourceText(fieldType, source)) !== `${syncAlias}.RWMutex`) continue;
+      const names = directDeclaredNames(field, source);
+      if (names.length === 0) fields.set("", field);
+      else for (const fieldName of names) fields.set(fieldName, field);
+    }
+    if (fields.size > 0) result.set(sourceText(name, source), fields);
+  }
+  for (const method of descendants(root, "method_declaration")) {
+    const receiverType = methodReceiverTypeName(method, source);
+    const name = functionNameOf(method, source);
+    if (receiverType !== undefined && (name === "RLock" || name === "RUnlock")) {
+      result.get(receiverType)?.delete("");
+    }
+  }
+  return result;
+}
+
+function methodReceiverBinding(method: Node, source: string): { name: string; type: string } | undefined {
+  const receiver = method.childForFieldName("receiver");
+  const declaration = receiver === null ? undefined : descendants(receiver, "parameter_declaration")[0];
+  const type = declaration?.childForFieldName("type");
+  const name = declaration === undefined ? undefined : directDeclaredNames(declaration, source)[0];
+  if (type === undefined || type === null || name === undefined) return undefined;
+  const normalized = normalizeGoType(sourceText(type, source));
+  return /^[A-Za-z_]\w*$/.test(normalized) ? { name, type: normalized } : undefined;
+}
+
+function receiverLockField(
+  operand: string,
+  receiver: string,
+  fields: Map<string, Node>,
+): string | undefined {
+  if (operand === receiver && fields.has("")) return "";
+  const prefix = `${receiver}.`;
+  if (!operand.startsWith(prefix)) return undefined;
+  const field = operand.slice(prefix.length);
+  return !field.includes(".") && fields.size === 1 && fields.has(field) ? field : undefined;
+}
+
+function directTopLevelStatement(node: Node, statementList: Node): Node | undefined {
+  let current: Node | null = node;
+  while (current !== null && current.parent?.id !== statementList.id) current = current.parent;
+  return current?.parent?.id === statementList.id ? current : undefined;
+}
+
+function isDeferredUnlockCall(call: Node): boolean {
+  let current: Node | null = call.parent;
+  while (current !== null) {
+    if (current.type === "defer_statement") return true;
+    if (current.type === "statement_list" || current.type === "function_declaration" ||
+        current.type === "method_declaration" || current.type === "func_literal") return false;
+    current = current.parent;
+  }
+  return false;
+}
+
+function receiverMapWrites(
+  method: Node,
+  body: Node,
+  source: string,
+  index: MutableStateIndex,
+  receiver: string,
+): Node[] {
+  const writes: Node[] = [];
+  for (const assignment of functionDescendants(method, body, "assignment_statement")) {
+    const left = assignment.childForFieldName("left")?.namedChildren ?? [];
+    if (left.some((candidate) => receiverMapExpression(candidate, source, index, receiver) !== undefined)) {
+      writes.push(assignment);
+    }
+  }
+  for (const update of functionDescendants(method, body, "inc_statement")) {
+    if (update.namedChildren.some((candidate) =>
+      receiverMapExpression(candidate, source, index, receiver) !== undefined)) writes.push(update);
+  }
+  for (const call of functionDescendants(method, body, "call_expression")) {
+    const fn = call.childForFieldName("function");
+    const args = call.childForFieldName("arguments")?.namedChildren ?? [];
+    if (fn?.type === "identifier" && sourceText(fn, source) === "delete" && args[0] !== undefined &&
+        isBuiltinDelete(call, method, source) &&
+        receiverMapExpression(args[0], source, index, receiver) !== undefined) writes.push(call);
+  }
+  return writes;
+}
+
+function writtenMapExpression(
+  write: Node,
+  source: string,
+  index: MutableStateIndex,
+  receiver: string,
+): string | undefined {
+  if (write.type === "call_expression") {
+    const arg = write.childForFieldName("arguments")?.namedChildren[0];
+    return arg === undefined ? undefined : receiverMapExpression(arg, source, index, receiver);
+  }
+  const left = write.childForFieldName("left")?.namedChildren ?? write.namedChildren;
+  return left.map((candidate) => receiverMapExpression(candidate, source, index, receiver))
+    .find((candidate): candidate is string => candidate !== undefined);
+}
+
+function receiverMapExpression(
+  node: Node,
+  source: string,
+  index: MutableStateIndex,
+  receiver: string,
+): string | undefined {
+  const map = node.type === "index_expression" ? node.childForFieldName("operand") : node;
+  if (map === null || !isMutableStateExpression(map, index)) return undefined;
+  const text = sourceText(map, source);
+  return text.startsWith(`${receiver}.`) ? text : undefined;
+}
+
+function staticallyDeadNode(node: Node, callableBody: Node, source: string): boolean {
+  let current: Node | null = node;
+  while (current !== null && current.id !== callableBody.id) {
+    const parent: Node | null = current.parent;
+    if (parent?.type === "if_statement") {
+      const condition = parent.childForFieldName("condition");
+      const consequence = parent.childForFieldName("consequence");
+      const alternative = parent.childForFieldName("alternative");
+      const value = condition === null ? undefined : semanticText(sourceText(condition, source));
+      if ((value === "false" && consequence !== null && nodeInside(node, consequence)) ||
+          (value === "true" && alternative !== null && nodeInside(node, alternative))) return true;
+    }
+    current = parent;
+  }
+  return false;
+}
+
+function nodeReachableInCallable(
+  node: Node,
+  callable: Node,
+  callableBody: Node,
+  source: string,
+): boolean {
+  if (staticallyDeadNode(node, callableBody, source)) return false;
+  let current: Node | null = node;
+  while (current !== null && current.id !== callableBody.id) {
+    let direct: Node = current;
+    while (direct.parent !== null && direct.parent.type !== "statement_list" &&
+        direct.parent.id !== callableBody.id) direct = direct.parent;
+    const list = direct.parent?.type === "statement_list" ? direct.parent : undefined;
+    if (list === undefined) {
+      current = direct.parent;
+      continue;
+    }
+    let outcomes = pathContinues;
+    for (const statement of list.namedChildren) {
+      if (statement.id === direct.id) break;
+      if ((outcomes & pathContinues) === 0) return false;
+      outcomes = (outcomes & ~pathContinues) |
+        statementTerminationOutcomes(statement, callable, source, true);
+    }
+    if ((outcomes & pathContinues) === 0) return false;
+    current = list.parent;
+  }
+  return true;
+}
+
+function isBuiltinDelete(call: Node, callable: Node, source: string): boolean {
+  if (isLocallyShadowedAt(callable, call, source, "delete")) return false;
+  let root = callable;
+  while (root.parent !== null) root = root.parent;
+  return !descendants(root, "function_declaration").some((fn) => {
+    const name = fn.childForFieldName("name");
+    return name !== null && sourceText(name, source) === "delete";
+  }) && !descendants(root, "var_spec").some((spec) =>
+    findEnclosingCallable(spec) === null && directDeclaredNames(spec, source).includes("delete"));
+}
+
+function nodeInside(node: Node, ancestor: Node): boolean {
+  return node.startIndex >= ancestor.startIndex && node.endIndex <= ancestor.endIndex;
 }
 
 interface PrematureStateMarker {
