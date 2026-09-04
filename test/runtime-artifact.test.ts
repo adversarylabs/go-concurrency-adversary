@@ -91,7 +91,7 @@ test("the published runtime executes without node_modules", async () => {
   const envelope = JSON.parse(await readFile(output, "utf8"));
   assert.equal(envelope.protocolVersion, 1);
   assert.equal(envelope.result.adversary.name, "go-concurrency");
-  assert.equal(envelope.result.adversary.version, "0.0.26");
+  assert.equal(envelope.result.adversary.version, "0.0.27");
   assert.deepEqual(envelope.result.findings, []);
 
   await mkdir(join(repository, "plugins/server/internal"), { recursive: true });
@@ -136,7 +136,7 @@ func (s server) Start(ctx context.Context) error {
     },
   });
   const detectorEnvelope = JSON.parse(await readFile(output, "utf8"));
-  assert.equal(detectorEnvelope.result.adversary.version, "0.0.26");
+  assert.equal(detectorEnvelope.result.adversary.version, "0.0.27");
   assert.equal(
     detectorEnvelope.result.findings.filter(
       (finding: { ruleId?: string }) => finding.ruleId === "go-concurrency.async-listener.missing-close",
